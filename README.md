@@ -22,6 +22,12 @@ Runs on **Windows** (fully tested), **macOS**, and **Linux**.
 
    ![animation styles](docs/styles.png)
 
+   Optionally add a **company / logo watermark** with **💧 Logo** — pick any
+   PNG/GIF/JPG (transparent PNG looks best), or re-pick one of your
+   **recently-used** logos from the menu. It rides on the snip with a subtle
+   water **ripple**. **Drag** it to reposition; **scroll** the mouse wheel over
+   it to resize; **🚫** removes it.
+
 3. **Copy (Ctrl/Cmd+C)** → a looping animated GIF is placed on the clipboard.
    Pastes as an **animated file** into Slack / Discord / Teams / Finder /
    Explorer, and as a **static image** into apps that only accept bitmaps.

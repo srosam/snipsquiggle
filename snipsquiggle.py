@@ -13,6 +13,8 @@ Flow:
         Ants  - marching-ants moving dashes
         Dots  - dots flowing along the stroke
         Emoji - emojis marching along the stroke (🔥 ❤️ ⭐ ...)
+     Optionally add a company/logo watermark (💧 Logo): drag to reposition,
+     mouse-wheel over it to resize. It ripples with a gentle water wibble.
   3. Ctrl+C copies a looping animated GIF to the clipboard.
        Windows: CF_HDROP (file) + CF_DIB (static) + "GIF" bytes
        macOS:   NSPasteboard public.gif + public.png + file URL
@@ -25,6 +27,7 @@ See requirements.txt.
 import io
 import os
 import sys
+import json
 import math
 import bisect
 import random
@@ -34,7 +37,7 @@ import ctypes
 
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox
-from PIL import Image, ImageTk, ImageGrab, ImageDraw, ImageFont
+from PIL import Image, ImageTk, ImageGrab, ImageDraw, ImageFont, ImageOps
 
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -314,6 +317,84 @@ def emoji_image(char, px):
             pass
     _EMOJI_CACHE[key] = glyph
     return glyph
+
+
+# ---------------------------------------------------------------------------
+# Watermark / logo ripple. Warp an RGBA logo with a gentle, smoothly-looping
+# water "wibble" so frame 0 == frame N (seamless GIF loop). Implemented as a
+# per-frame PIL MESH transform: the image is diced into a grid and each cell's
+# source quad is nudged by two orthogonal sines whose phase advances with the
+# frame, giving a shimmering ripple.
+# ---------------------------------------------------------------------------
+def ripple_variants(logo, n, strength=0.018):
+    """Return n RGBA frames of `logo`, each rippled, looping over the phase.
+
+    strength is the wobble amplitude as a fraction of the logo's smaller side.
+    A transparent border is added so displaced samples never clip the edges.
+    """
+    logo = logo.convert("RGBA")
+    amp = max(1.5, min(logo.size) * strength)
+    pad = int(math.ceil(amp)) + 2
+    img = ImageOps.expand(logo, border=pad, fill=(0, 0, 0, 0))
+    w, h = img.size
+
+    # ~1.3 waves across the width, ~1.7 down the height -> organic, not gridded.
+    kx = 2 * math.pi * 1.3 / max(1, w)
+    ky = 2 * math.pi * 1.7 / max(1, h)
+    step = max(6, min(w, h) // 16)
+    xs = list(range(0, w, step)) + [w]
+    ys = list(range(0, h, step)) + [h]
+
+    frames = []
+    for f in range(n):
+        ph = 2 * math.pi * f / max(1, n)
+
+        def src(x, y):
+            return (x + amp * math.sin(y * ky + ph),
+                    y + amp * math.cos(x * kx + ph))
+
+        mesh = []
+        for iy in range(len(ys) - 1):
+            for ix in range(len(xs) - 1):
+                x1, x2 = xs[ix], xs[ix + 1]
+                y1, y2 = ys[iy], ys[iy + 1]
+                nw, sw = src(x1, y1), src(x1, y2)
+                se, ne = src(x2, y2), src(x2, y1)
+                # MESH src quad order: NW, SW, SE, NE
+                quad = (nw[0], nw[1], sw[0], sw[1],
+                        se[0], se[1], ne[0], ne[1])
+                mesh.append(((x1, y1, x2, y2), quad))
+        frames.append(img.transform((w, h), Image.MESH, mesh, Image.BILINEAR))
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# Recently-used logos: a small JSON list of absolute paths (most-recent first),
+# stored per-user so the picker remembers logos across sessions.
+# ---------------------------------------------------------------------------
+RECENT_PATH = os.path.join(os.path.expanduser("~"), ".snipsquiggle_recent.json")
+MAX_RECENT = 8
+
+
+def load_recent_logos():
+    try:
+        with open(RECENT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [p for p in data if isinstance(p, str)]
+    except Exception:
+        return []
+
+
+def add_recent_logo(path):
+    path = os.path.abspath(path)
+    same = os.path.normcase(path)
+    recent = [p for p in load_recent_logos() if os.path.normcase(p) != same]
+    recent.insert(0, path)
+    try:
+        with open(RECENT_PATH, "w", encoding="utf-8") as f:
+            json.dump(recent[:MAX_RECENT], f)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +691,8 @@ class Editor:
         self._live_pts = []
         self._live_start = None
         self._emoji_photos = {}
+        self.watermark = None      # see load_watermark() for shape
+        self._wm_drag = None       # (dx, dy) offset while dragging the logo
 
         self.win = tk.Toplevel(root)
         self.win.title("SnipSquiggle")
@@ -628,6 +711,11 @@ class Editor:
         self.canvas.bind("<Button-1>", self._down)
         self.canvas.bind("<B1-Motion>", self._move)
         self.canvas.bind("<ButtonRelease-1>", self._up)
+
+        # Mouse wheel resizes the watermark when hovering over it.
+        self.canvas.bind("<MouseWheel>", self._on_wheel)                 # Win/Mac
+        self.canvas.bind("<Button-4>", lambda e: self._on_wheel(e, 1))   # Linux
+        self.canvas.bind("<Button-5>", lambda e: self._on_wheel(e, -1))  # Linux
 
         # Ctrl on Win/Linux, Command on macOS
         mod = "Command" if IS_MAC else "Control"
@@ -689,6 +777,10 @@ class Editor:
         self._sep(bar)
         self._btn(bar, "↶ Undo", self.undo)
         self._btn(bar, "✕ Clear", self.clear)
+        self._sep(bar)
+        self.logo_btn = self._btn(bar, "💧 Logo", self.load_watermark)
+        self.logo_rm_btn = self._btn(bar, "🚫", self.remove_watermark)
+        self._label(bar, "drag · scroll to size")
 
         right = tk.Frame(bar, bg="#1e1e1e")
         right.pack(side="right")
@@ -752,12 +844,110 @@ class Editor:
     def set_width(self, w):
         self.width = w
 
+    # -- watermark / logo ---------------------------------------------------
+    def load_watermark(self):
+        """Pop a menu of recently-used logos + Browse…; browse directly if none."""
+        recent = [p for p in load_recent_logos() if os.path.exists(p)]
+        if not recent:
+            self._browse_watermark()
+            return
+        menu = tk.Menu(self.win, tearoff=0)
+        for p in recent:
+            menu.add_command(label=os.path.basename(p),
+                             command=lambda pp=p: self._use_watermark(pp))
+        menu.add_separator()
+        menu.add_command(label="Browse…", command=self._browse_watermark)
+        try:
+            menu.tk_popup(self.win.winfo_pointerx(), self.win.winfo_pointery())
+        finally:
+            menu.grab_release()
+
+    def _browse_watermark(self):
+        path = filedialog.askopenfilename(
+            parent=self.win, title="Choose a logo / watermark",
+            filetypes=[("Images", "*.png *.gif *.jpg *.jpeg *.bmp *.webp"),
+                       ("All files", "*.*")])
+        if path:
+            self._use_watermark(path)
+
+    def _use_watermark(self, path):
+        try:
+            natural = Image.open(path).convert("RGBA")
+            natural.load()
+        except Exception as ex:
+            messagebox.showerror("Load failed", str(ex), parent=self.win)
+            return
+        add_recent_logo(path)
+        # Fit to ~22% of the snip width on first load.
+        scale = min(1.0, (self.image.width * 0.22) / natural.width)
+        self.watermark = {
+            "natural": natural,
+            "scale": scale,
+            "cx": self.image.width - 1,   # placed properly by _rebuild_watermark
+            "cy": self.image.height - 1,
+            "place_corner": True,         # snap to bottom-right until first drag
+        }
+        self._rebuild_watermark()
+        self._flash(self.logo_btn, "💧 drag · scroll")
+
+    def remove_watermark(self):
+        self.watermark = None
+        self._wm_drag = None
+
+    def _rebuild_watermark(self):
+        """(Re)scale the logo and precompute its rippled frames + canvas photos."""
+        wm = self.watermark
+        if not wm:
+            return
+        nat = wm["natural"]
+        bw = max(1, int(nat.width * wm["scale"]))
+        bh = max(1, int(nat.height * wm["scale"]))
+        base = nat.resize((bw, bh), Image.LANCZOS)
+        frames = ripple_variants(base, N_FRAMES)
+        wm["frames_img"] = frames
+        wm["photos"] = [ImageTk.PhotoImage(fr) for fr in frames]
+        wm["w"], wm["h"] = frames[0].size
+        if wm.pop("place_corner", False):
+            m = 14 + max(wm["w"], wm["h"]) / 2
+            wm["cx"] = self.image.width - m
+            wm["cy"] = self.image.height - m
+        # Keep the logo on-canvas after a resize.
+        wm["cx"] = min(max(wm["cx"], wm["w"] / 2), self.image.width - wm["w"] / 2)
+        wm["cy"] = min(max(wm["cy"], wm["h"] / 2), self.image.height - wm["h"] / 2)
+
+    def _in_watermark(self, x, y):
+        wm = self.watermark
+        if not wm:
+            return False
+        return (abs(x - wm["cx"]) <= wm["w"] / 2 and
+                abs(y - wm["cy"]) <= wm["h"] / 2)
+
+    def _on_wheel(self, e, direction=None):
+        wm = self.watermark
+        if not wm or not self._in_watermark(e.x, e.y):
+            return
+        if direction is None:                       # Win/Mac carry delta
+            direction = 1 if getattr(e, "delta", 0) > 0 else -1
+        wm["scale"] = max(0.05, min(8.0, wm["scale"] * (1.1 if direction > 0 else 0.9)))
+        self._rebuild_watermark()
+
     # -- drawing ------------------------------------------------------------
     def _down(self, e):
+        # Clicking on the logo grabs it for repositioning instead of drawing.
+        if self._in_watermark(e.x, e.y):
+            wm = self.watermark
+            self._wm_drag = (e.x - wm["cx"], e.y - wm["cy"])
+            return
         self._live_start = (e.x, e.y)
         self._live_pts = [(e.x, e.y)]
 
     def _move(self, e):
+        if self._wm_drag is not None:
+            wm = self.watermark
+            dx, dy = self._wm_drag
+            wm["cx"] = min(max(e.x - dx, wm["w"] / 2), self.image.width - wm["w"] / 2)
+            wm["cy"] = min(max(e.y - dy, wm["h"] / 2), self.image.height - wm["h"] / 2)
+            return
         if self._live_start is None:
             return
         p = (e.x, e.y)
@@ -779,6 +969,9 @@ class Editor:
                                     arrow="last", tags="live")
 
     def _up(self, e):
+        if self._wm_drag is not None:
+            self._wm_drag = None
+            return
         if self._live_start is None:
             return
         self.canvas.delete("live")
@@ -820,6 +1013,10 @@ class Editor:
     def _tick(self):
         self.frame = (self.frame + 1) % N_FRAMES
         self.canvas.delete("stroke")
+        if self.watermark:
+            wm = self.watermark
+            self.canvas.create_image(wm["cx"], wm["cy"],
+                                     image=wm["photos"][self.frame], tags="stroke")
         for s in self.strokes:
             for op in s["ops"][self.frame]:
                 kind = op[0]
@@ -844,6 +1041,10 @@ class Editor:
         frames = []
         for f in range(N_FRAMES):
             im = self.image.convert("RGBA")
+            if self.watermark:
+                g = self.watermark["frames_img"][f]
+                im.alpha_composite(g, (int(self.watermark["cx"] - g.width / 2),
+                                       int(self.watermark["cy"] - g.height / 2)))
             d = ImageDraw.Draw(im)
             for s in self.strokes:
                 for op in s["ops"][f]:
