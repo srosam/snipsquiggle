@@ -177,10 +177,11 @@ def dash_segments(pts, cl, phase, on, off):
 
 
 def spaced_positions(pts, cl, phase, spacing):
-    """Positions every `spacing` px along the path, shifted by phase."""
+    """Positions every `spacing` px along the path, marching forward with phase
+    (same direction convention as the stroke was drawn / marching ants)."""
     L = cl[-1]
     out = []
-    s = (-phase) % spacing
+    s = phase % spacing
     while s <= L:
         out.append(point_at(pts, cl, s))
         s += spacing
@@ -209,8 +210,9 @@ def emoji_image(char, px):
     key = (char, px)
     if key in _EMOJI_CACHE:
         return _EMOJI_CACHE[key]
-    # Render on an oversized canvas so nothing clips, then crop to the glyph.
-    box = int(px * 2)
+    # Render on an oversized canvas so nothing clips (emoji advance metrics are
+    # asymmetric, e.g. the arrow/heart sit far from center), then crop tight.
+    box = int(px * 3)
     img = Image.new("RGBA", (box, box), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     try:
