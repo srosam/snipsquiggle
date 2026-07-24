@@ -1,45 +1,56 @@
 """
 SnipSquiggle - a Snipping-Tool-style capture + animated annotation app.
 
+Cross-platform (Windows fully tested; macOS/Linux paths included).
+
 Flow:
-  1. Launch -> screen dims, drag a rectangle to snip (Esc cancels).
+  1. Launch -> select a screen region to snip.
+       Windows/Linux: a dimmed overlay, drag a rectangle (Esc cancels).
+       macOS:         the native `screencapture -i` crosshair.
   2. Editor opens with your snip. Draw with pen / arrow / box, and pick an
-     animation style for each stroke:
+     animation style per stroke:
         Boil  - hand-drawn squiggle that gently wobbles (default)
         Ants  - marching-ants moving dashes
         Dots  - dots flowing along the stroke
         Emoji - emojis marching along the stroke (🔥 ❤️ ⭐ ...)
   3. Ctrl+C copies a looping animated GIF to the clipboard.
-     (Pastes as an animated file into Slack/Discord/Teams/Explorer,
-      and as a static image everywhere else.)
+       Windows: CF_HDROP (file) + CF_DIB (static) + "GIF" bytes
+       macOS:   NSPasteboard public.gif + public.png + file URL
+       Linux:   xclip / wl-copy image/gif (best effort)
 
-Deps: pillow, pywin32   (see requirements.txt)
+Deps: pillow (all), pywin32 (Windows), pyobjc-framework-Cocoa (macOS).
+See requirements.txt.
 """
 
 import io
 import os
+import sys
 import math
 import bisect
 import random
 import tempfile
+import subprocess
 import ctypes
-from ctypes import wintypes
 
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox
 from PIL import Image, ImageTk, ImageGrab, ImageDraw, ImageFont
 
+IS_WIN = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = not IS_WIN and not IS_MAC
+
 # ---------------------------------------------------------------------------
-# Make the process DPI-aware so tkinter pixel coords match the physical
-# screenshot pixels (essential on scaled Windows displays).
+# DPI awareness (Windows) so tkinter pixel coords match the physical screenshot.
 # ---------------------------------------------------------------------------
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
+if IS_WIN:
     try:
-        ctypes.windll.user32.SetProcessDPIAware()
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
-        pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Animation / drawing tuning
@@ -51,7 +62,6 @@ JITTER_BASE = 1.8     # base wobble amplitude (px)
 
 PALETTE = ["#ff3b30", "#ffcc00", "#34c759", "#0a84ff", "#000000", "#ffffff"]
 EMOJIS = ["🔥", "❤️", "⭐", "✅", "👍", "😂", "🎉", "➡️", "💯", "👀"]
-EMOJI_FONT_PATH = r"C:\Windows\Fonts\seguiemj.ttf"
 
 
 # ---------------------------------------------------------------------------
@@ -191,41 +201,103 @@ def spaced_positions(pts, cl, phase, spacing):
 
 
 # ---------------------------------------------------------------------------
-# Emoji rasterisation (color glyphs via Segoe UI Emoji), cached
+# Emoji rasterisation (color glyphs), cross-platform + cached.
+# Windows: Segoe UI Emoji (scalable COLR). macOS: Apple Color Emoji (fixed
+# bitmap strikes -> render at a strike size then downscale). Linux: Noto Color
+# Emoji if installed. Drop a font in ./assets to override on any platform.
 # ---------------------------------------------------------------------------
 _FONT_CACHE = {}
 _EMOJI_CACHE = {}
+_EMOJI_FONT_PATH = None
 
 
-def emoji_font(px):
-    if px not in _FONT_CACHE:
-        try:
-            _FONT_CACHE[px] = ImageFont.truetype(EMOJI_FONT_PATH, px)
-        except Exception:
-            _FONT_CACHE[px] = ImageFont.load_default()
-    return _FONT_CACHE[px]
+def _emoji_font_candidates():
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = []
+    assets = os.path.join(here, "assets")
+    if os.path.isdir(assets):
+        for n in ("NotoColorEmoji.ttf", "emoji.ttf", "emoji.ttc",
+                  "seguiemj.ttf", "Apple Color Emoji.ttc"):
+            cands.append(os.path.join(assets, n))
+    if IS_WIN:
+        cands.append(r"C:\Windows\Fonts\seguiemj.ttf")
+    elif IS_MAC:
+        cands.append("/System/Library/Fonts/Apple Color Emoji.ttc")
+    else:
+        cands += [
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+            "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
+            "/usr/share/fonts/NotoColorEmoji.ttf",
+        ]
+    return [p for p in cands if os.path.exists(p)]
+
+
+def _resolve_emoji_font():
+    global _EMOJI_FONT_PATH
+    if _EMOJI_FONT_PATH is None:
+        paths = _emoji_font_candidates()
+        _EMOJI_FONT_PATH = paths[0] if paths else ""
+    return _EMOJI_FONT_PATH
+
+
+def _emoji_font(path, size):
+    key = (path, size)
+    if key not in _FONT_CACHE:
+        _FONT_CACHE[key] = ImageFont.truetype(path, size)
+    return _FONT_CACHE[key]
+
+
+def _px_order(px):
+    """Sizes to try: requested first (works for scalable fonts), then the common
+    color-bitmap strike sizes (Apple 160/128/96/64..., Noto 136/109)."""
+    order, seen, out = [px, 160, 137, 136, 128, 109, 96, 64, 48, 40, 32, 20], set(), []
+    for s in order:
+        s = int(s)
+        if s > 0 and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 def emoji_image(char, px):
     key = (char, px)
     if key in _EMOJI_CACHE:
         return _EMOJI_CACHE[key]
-    # Render on an oversized canvas so nothing clips (emoji advance metrics are
-    # asymmetric, e.g. the arrow/heart sit far from center), then crop tight.
-    box = int(px * 3)
-    img = Image.new("RGBA", (box, box), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    try:
-        d.text((box / 2, box / 2), char, font=emoji_font(px),
-               anchor="mm", embedded_color=True)
-    except Exception:
-        d.text((box / 2, box / 2), char, font=emoji_font(px),
-               anchor="mm", fill=(0, 0, 0, 255))
-    bbox = img.getbbox()
-    if bbox:
-        img = img.crop(bbox)
-    _EMOJI_CACHE[key] = img
-    return img
+    path = _resolve_emoji_font()
+    glyph = None
+    if path:
+        for rpx in _px_order(px):
+            try:
+                font = _emoji_font(path, rpx)
+                # Oversized canvas so asymmetric glyphs (arrow/heart) never clip.
+                box = int(rpx * 3)
+                tmp = Image.new("RGBA", (box, box), (0, 0, 0, 0))
+                d = ImageDraw.Draw(tmp)
+                d.text((box / 2, box / 2), char, font=font,
+                       anchor="mm", embedded_color=True)
+                bb = tmp.getbbox()
+                if not bb:
+                    continue
+                g = tmp.crop(bb)
+                if rpx != px:
+                    fac = px / rpx
+                    g = g.resize((max(1, round(g.width * fac)),
+                                  max(1, round(g.height * fac))), Image.LANCZOS)
+                glyph = g
+                break
+            except Exception:
+                continue
+    if glyph is None:  # last-ditch: monochrome text
+        box = int(px * 1.4)
+        glyph = Image.new("RGBA", (box, box), (0, 0, 0, 0))
+        try:
+            ImageDraw.Draw(glyph).text((box / 2, box / 2), char, anchor="mm",
+                                       fill=(0, 0, 0, 255))
+        except Exception:
+            pass
+    _EMOJI_CACHE[key] = glyph
+    return glyph
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +316,6 @@ def build_ops(polylines, color, width, anim, emoji, seed):
                            for pl in variants[f] if len(pl) >= 2])
         return frames
 
-    # ants / dots / emoji all march along one fixed, gently-wobbled path
     base = wobble_once(polylines, width, seed)
     metas = [(pl, cumlen(pl)) for pl in base if len(pl) >= 2]
 
@@ -283,7 +354,7 @@ def build_ops(polylines, color, width, anim, emoji, seed):
                     ops.append(("emoji", x, y + bob, emoji, px))
             frames.append(ops)
 
-    else:  # fallback: plain wobble
+    else:
         for _ in range(N_FRAMES):
             frames.append([("line", pl, color, width) for pl, _cl in metas])
 
@@ -291,81 +362,155 @@ def build_ops(polylines, color, width, anim, emoji, seed):
 
 
 # ---------------------------------------------------------------------------
-# Windows clipboard (raw, via ctypes so 64-bit handles are safe)
+# Clipboard: put a looping animated GIF on the system clipboard.
 # ---------------------------------------------------------------------------
-_k32 = ctypes.windll.kernel32
-_u32 = ctypes.windll.user32
-_k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
-_k32.GlobalAlloc.restype = ctypes.c_void_p
-_k32.GlobalLock.argtypes = [ctypes.c_void_p]
-_k32.GlobalLock.restype = ctypes.c_void_p
-_k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-_k32.GlobalUnlock.restype = wintypes.BOOL
-_u32.OpenClipboard.argtypes = [wintypes.HWND]
-_u32.OpenClipboard.restype = wintypes.BOOL
-_u32.EmptyClipboard.restype = wintypes.BOOL
-_u32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
-_u32.SetClipboardData.restype = ctypes.c_void_p
-_u32.CloseClipboard.restype = wintypes.BOOL
-_u32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
-_u32.RegisterClipboardFormatW.restype = wintypes.UINT
-
-GMEM_MOVEABLE = 0x0002
-CF_DIB = 8
-CF_HDROP = 15
-
-
-def _global_from_bytes(data: bytes):
-    h = _k32.GlobalAlloc(GMEM_MOVEABLE, len(data))
-    ptr = _k32.GlobalLock(h)
-    ctypes.memmove(ptr, data, len(data))
-    _k32.GlobalUnlock(h)
-    return h
-
-
-def _hdrop_bytes(paths):
-    import struct
-    header = struct.pack("<IiiiI", 20, 0, 0, 0, 1)  # DROPFILES, fWide=1
-    body = "".join(p + "\0" for p in paths) + "\0"
-    return header + body.encode("utf-16-le")
-
-
-def _dib_bytes(im: Image.Image):
-    buf = io.BytesIO()
-    im.convert("RGB").save(buf, "BMP")
-    return buf.getvalue()[14:]  # strip BITMAPFILEHEADER -> CF_DIB
-
-
 def set_clipboard(gif_path, static_frame):
-    cf_gif = _u32.RegisterClipboardFormatW("GIF")
+    if IS_WIN:
+        _clip_win(gif_path, static_frame)
+    elif IS_MAC:
+        _clip_mac(gif_path, static_frame)
+    else:
+        _clip_linux(gif_path, static_frame)
+
+
+if IS_WIN:
+    from ctypes import wintypes
+
+    _k32 = ctypes.windll.kernel32
+    _u32 = ctypes.windll.user32
+    _k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    _k32.GlobalAlloc.restype = ctypes.c_void_p
+    _k32.GlobalLock.argtypes = [ctypes.c_void_p]
+    _k32.GlobalLock.restype = ctypes.c_void_p
+    _k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    _k32.GlobalUnlock.restype = wintypes.BOOL
+    _u32.OpenClipboard.argtypes = [wintypes.HWND]
+    _u32.OpenClipboard.restype = wintypes.BOOL
+    _u32.EmptyClipboard.restype = wintypes.BOOL
+    _u32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+    _u32.SetClipboardData.restype = ctypes.c_void_p
+    _u32.CloseClipboard.restype = wintypes.BOOL
+    _u32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    _u32.RegisterClipboardFormatW.restype = wintypes.UINT
+
+    _GMEM_MOVEABLE = 0x0002
+    _CF_DIB = 8
+    _CF_HDROP = 15
+
+    def _global_from_bytes(data):
+        h = _k32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
+        ptr = _k32.GlobalLock(h)
+        ctypes.memmove(ptr, data, len(data))
+        _k32.GlobalUnlock(h)
+        return h
+
+    def _hdrop_bytes(paths):
+        import struct
+        header = struct.pack("<IiiiI", 20, 0, 0, 0, 1)  # DROPFILES, fWide=1
+        body = "".join(p + "\0" for p in paths) + "\0"
+        return header + body.encode("utf-16-le")
+
+    def _dib_bytes(im):
+        buf = io.BytesIO()
+        im.convert("RGB").save(buf, "BMP")
+        return buf.getvalue()[14:]  # strip BITMAPFILEHEADER -> CF_DIB
+
+    def _clip_win(gif_path, static_frame):
+        cf_gif = _u32.RegisterClipboardFormatW("GIF")
+        with open(gif_path, "rb") as f:
+            gif_bytes = f.read()
+        payloads = {
+            _CF_HDROP: _hdrop_bytes([gif_path]),
+            _CF_DIB: _dib_bytes(static_frame),
+            cf_gif: gif_bytes,
+        }
+        if not _u32.OpenClipboard(None):
+            raise OSError("Could not open clipboard")
+        try:
+            _u32.EmptyClipboard()
+            for fmt, data in payloads.items():
+                _u32.SetClipboardData(fmt, _global_from_bytes(data))
+        finally:
+            _u32.CloseClipboard()
+
+
+def _clip_mac(gif_path, static_frame):
+    # PyObjC: set gif data, png fallback, and a file URL (for file-paste targets).
+    from AppKit import NSPasteboard, NSPasteboardItem
+    from Foundation import NSData, NSURL
+
     with open(gif_path, "rb") as f:
-        gif_bytes = f.read()
-    payloads = {
-        CF_HDROP: _hdrop_bytes([gif_path]),
-        CF_DIB: _dib_bytes(static_frame),
-        cf_gif: gif_bytes,
-    }
-    if not _u32.OpenClipboard(None):
-        raise OSError("Could not open clipboard")
+        gif = f.read()
+    png_buf = io.BytesIO()
+    static_frame.convert("RGB").save(png_buf, "PNG")
+    png = png_buf.getvalue()
+
+    pb = NSPasteboard.generalPasteboard()
+    pb.clearContents()
+    item = NSPasteboardItem.alloc().init()
+    item.setData_forType_(NSData.dataWithBytes_length_(gif, len(gif)),
+                          "com.compuserve.gif")
+    item.setData_forType_(NSData.dataWithBytes_length_(png, len(png)),
+                          "public.png")
+    url = NSURL.fileURLWithPath_(gif_path)
+    if not pb.writeObjects_([item, url]):
+        raise OSError("NSPasteboard writeObjects failed")
+
+
+def _clip_linux(gif_path, static_frame):
+    import shutil
+    with open(gif_path, "rb") as f:
+        gif = f.read()
+    if shutil.which("xclip"):
+        subprocess.run(["xclip", "-selection", "clipboard", "-t", "image/gif"],
+                       input=gif, check=True)
+        return
+    if shutil.which("wl-copy"):
+        subprocess.run(["wl-copy", "--type", "image/gif"], input=gif, check=True)
+        return
+    raise OSError("No clipboard tool found. Install 'xclip' (X11) or "
+                  "'wl-clipboard' (Wayland). The GIF was still saved.")
+
+
+# ===========================================================================
+# Screen capture
+# ===========================================================================
+def mac_screencapture():
+    """Native macOS interactive snip. Returns a PIL.Image or None if cancelled."""
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
     try:
-        _u32.EmptyClipboard()
-        for fmt, data in payloads.items():
-            _u32.SetClipboardData(fmt, _global_from_bytes(data))
-    finally:
-        _u32.CloseClipboard()
+        os.remove(path)  # screencapture only writes the file if a snip is made
+    except OSError:
+        pass
+    try:
+        subprocess.run(["screencapture", "-i", "-x", path], check=False)
+    except FileNotFoundError:
+        return None
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        img = Image.open(path).convert("RGB")
+        img.load()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return img
+    return None
 
 
-# ===========================================================================
-# Screen capture overlay
-# ===========================================================================
-class Capture:
+class OverlayCapture:
+    """Dimmed full-screen overlay with drag-to-select (Windows / Linux)."""
+
     def __init__(self, root, on_done):
         self.root = root
         self.on_done = on_done
 
-        self.shot = ImageGrab.grab(all_screens=True)
-        vx = ctypes.windll.user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
-        vy = ctypes.windll.user32.GetSystemMetrics(77)
+        self.shot = ImageGrab.grab(all_screens=True) if IS_WIN else ImageGrab.grab()
+        if IS_WIN:
+            vx = ctypes.windll.user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+            vy = ctypes.windll.user32.GetSystemMetrics(77)
+        else:
+            vx = vy = 0
         vw, vh = self.shot.size
 
         self.win = tk.Toplevel(root)
@@ -443,12 +588,12 @@ class Editor:
         self.tool = "pen"          # pen | arrow | box
         self.anim = "squiggle"     # squiggle | ants | dots | emoji
         self.emoji = "🔥"
-        self.strokes = []          # each: {ops:[frames], meta...}
+        self.strokes = []
         self.frame = 0
         self._seed = 0
         self._live_pts = []
         self._live_start = None
-        self._emoji_photos = {}    # (char,px) -> ImageTk.PhotoImage (keep refs)
+        self._emoji_photos = {}
 
         self.win = tk.Toplevel(root)
         self.win.title("SnipSquiggle")
@@ -468,10 +613,12 @@ class Editor:
         self.canvas.bind("<B1-Motion>", self._move)
         self.canvas.bind("<ButtonRelease-1>", self._up)
 
-        self.win.bind("<Control-c>", lambda e: self.copy_gif())
-        self.win.bind("<Control-s>", lambda e: self.save_gif())
-        self.win.bind("<Control-z>", lambda e: self.undo())
-        self.win.bind("<Control-n>", lambda e: self.new_snip())
+        # Ctrl on Win/Linux, Command on macOS
+        mod = "Command" if IS_MAC else "Control"
+        self.win.bind(f"<{mod}-c>", lambda e: self.copy_gif())
+        self.win.bind(f"<{mod}-s>", lambda e: self.save_gif())
+        self.win.bind(f"<{mod}-z>", lambda e: self.undo())
+        self.win.bind(f"<{mod}-n>", lambda e: self.new_snip())
         self.win.bind("<Escape>", lambda e: self._quit())
 
         self.win.after(200, self.win.focus_force)
@@ -494,7 +641,7 @@ class Editor:
                  font=("Segoe UI", 9)).pack(side="left", padx=(4, 2))
 
     def _build_toolbar(self):
-        # Row 1: tools / colors / sizes / undo / actions
+        mod = "Cmd" if IS_MAC else "Ctrl"
         bar = tk.Frame(self.win, bg="#1e1e1e")
         bar.pack(fill="x", padx=10, pady=(8, 2))
 
@@ -515,16 +662,15 @@ class Editor:
 
         right = tk.Frame(bar, bg="#1e1e1e")
         right.pack(side="right")
-        self._btn(right, "＋ New (Ctrl+N)", self.new_snip)
-        self._btn(right, "💾 Save (Ctrl+S)", self.save_gif)
-        self.copy_btn = tk.Button(right, text="📋 Copy GIF (Ctrl+C)",
+        self._btn(right, f"＋ New ({mod}+N)", self.new_snip)
+        self._btn(right, f"💾 Save ({mod}+S)", self.save_gif)
+        self.copy_btn = tk.Button(right, text=f"📋 Copy GIF ({mod}+C)",
                                   command=self.copy_gif, relief="flat",
                                   bg="#0a84ff", fg="white", bd=0, padx=12, pady=4,
                                   font=("Segoe UI", 9, "bold"),
                                   activebackground="#0060df", activeforeground="white")
         self.copy_btn.pack(side="left", padx=2)
 
-        # Row 2: animation style + emoji picker
         bar2 = tk.Frame(self.win, bg="#1e1e1e")
         bar2.pack(fill="x", padx=10, pady=(0, 6))
         self._label(bar2, "Animation:")
@@ -746,7 +892,10 @@ class App:
         self.root.after(120, self._do_capture)
 
     def _do_capture(self):
-        Capture(self.root, self._captured)
+        if IS_MAC:
+            self._captured(mac_screencapture())
+        else:
+            OverlayCapture(self.root, self._captured)
 
     def _captured(self, image):
         if image is None:
