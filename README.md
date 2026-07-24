@@ -51,6 +51,14 @@ Use **Ctrl** on Windows/Linux, **Cmd** on macOS.
 ## Platform notes
 
 - **macOS**
+  - **Needs Tk 8.6+.** Apple's built-in `python3` (Command Line Tools) uses the
+    old **Tk 8.5**, which crashes GUI apps. Use a Python with modern Tk:
+    ```sh
+    brew install python-tk
+    "$(brew --prefix)/bin/python3" snipsquiggle.py
+    ```
+    (or install Python from [python.org](https://www.python.org), which bundles
+    Tk 8.6). Check with `python3 -c "import tkinter; print(tkinter.TkVersion)"`.
   - First run needs **Screen Recording** permission (System Settings →
     Privacy & Security → Screen Recording) for the capture to contain window
     contents; grant it to your terminal / the built app, then relaunch.

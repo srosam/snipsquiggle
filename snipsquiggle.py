@@ -907,5 +907,19 @@ class App:
         self.root.mainloop()
 
 
+def _check_tk():
+    """Apple's system Tk 8.5 segfaults for GUI apps — bail with guidance."""
+    if IS_MAC and tk.TkVersion < 8.6:
+        sys.stderr.write(
+            "\nSnipSquiggle needs Tk 8.6+, but this Python is linked against "
+            f"Tk {tk.TkVersion} (Apple's system Tk), which crashes GUI apps.\n"
+            "Run it under a Python with modern Tk instead, e.g.:\n"
+            "  brew install python-tk\n"
+            "  \"$(brew --prefix)/bin/python3\" snipsquiggle.py\n"
+            "or install Python from https://www.python.org (bundles Tk 8.6).\n\n")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
+    _check_tk()
     App().run()
