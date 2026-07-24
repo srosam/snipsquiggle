@@ -44,6 +44,30 @@ python snipsquiggle.py
 
 > **On macOS, do the one-time setup below first** — the system Python won't work.
 
+### Tray mode — snip with PrintScreen (Windows)
+
+```sh
+python snipsquiggle.py --tray
+```
+
+Instead of snipping once and exiting, SnipSquiggle sits in the system tray and
+snips whenever you press **PrintScreen**. Right-click the tray icon for
+**Snip now** / **Quit**, or double-click it to snip. Closing the editor drops
+back to idle rather than quitting.
+
+**Start in the tray automatically at login:**
+
+```sh
+python create_shortcut.py --startup     # install (hidden, windowless)
+python create_shortcut.py --uninstall   # remove it again
+```
+
+> **Windows 11:** if PrintScreen does nothing, the built-in
+> *"Use the Print screen key to open screen snipping"* setting is holding the
+> key. Turn it off under **Settings → Accessibility → Keyboard**, then restart
+> SnipSquiggle. (SnipSquiggle warns you if it couldn't grab the key.) You can
+> always snip from the tray icon regardless.
+
 ## macOS setup (step by step)
 
 The app is a Tk GUI, so it needs a Python built against **Tk 8.6**. The two

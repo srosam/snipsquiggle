@@ -3,8 +3,14 @@ SnipSquiggle - a Snipping-Tool-style capture + animated annotation app.
 
 Cross-platform (Windows fully tested; macOS/Linux paths included).
 
+Run modes:
+  Default            One-shot: launch -> snip -> edit -> exit.
+  --tray  (Windows)  Resident: sits in the system tray and snips whenever you
+                     press PrintScreen. Right-click the tray icon to snip or
+                     quit; the editor closing returns to idle instead of exiting.
+
 Flow:
-  1. Launch -> select a screen region to snip.
+  1. Launch (or press PrintScreen in --tray mode) -> select a region to snip.
        Windows/Linux: a dimmed overlay, drag a rectangle (Esc cancels).
        macOS:         the native `screencapture -i` crosshair.
   2. Editor opens with your snip. Draw with pen / arrow / box, and pick an
@@ -29,9 +35,11 @@ import os
 import sys
 import json
 import math
+import queue
 import bisect
 import random
 import tempfile
+import threading
 import subprocess
 import ctypes
 
@@ -675,10 +683,11 @@ class OverlayCapture:
 # Editor
 # ===========================================================================
 class Editor:
-    def __init__(self, root, image, new_snip_cb):
+    def __init__(self, root, image, new_snip_cb, on_close=None):
         self.root = root
         self.image = image.convert("RGB")
         self.new_snip_cb = new_snip_cb
+        self.on_close = on_close or root.quit
 
         self.color = "#ff3b30"
         self.width = 5
@@ -1107,18 +1116,198 @@ class Editor:
 
     def _quit(self):
         self.win.destroy()
-        self.root.quit()
+        self.on_close()
+
+
+# ===========================================================================
+# System tray + global PrintScreen hotkey (Windows, resident mode)
+# ===========================================================================
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+
+
+def _log(msg):
+    """Diagnostics for tray mode (visible when launched from a console)."""
+    sys.stderr.write(f"[SnipSquiggle] {msg}\n")
+    sys.stderr.flush()
+
+
+class WinTray:
+    """A system-tray icon plus a global PrintScreen hotkey (Windows only).
+
+    Win32 hotkeys and tray callbacks need a live message loop, so this runs on
+    its own daemon thread with a hidden window. Because tkinter is not
+    thread-safe, we never touch Tk from here — events are pushed onto a
+    ``queue.Queue`` that the Tk main thread drains via ``App._poll_events``.
+
+    Queue messages: "snip", "quit", "hotkey_failed".
+    """
+
+    HOTKEY_ID = 0xB001
+    ID_SNIP = 1001
+    ID_QUIT = 1002
+
+    def __init__(self, events, icon_path=ICON_PATH):
+        import win32con
+        self._WM_TRAY = win32con.WM_APP + 1
+        self.events = events
+        self.icon_path = icon_path
+        self.hwnd = None
+        self._thread = threading.Thread(target=self._run, name="snip-tray",
+                                        daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        import win32con, win32gui
+        if self.hwnd:
+            win32gui.PostMessage(self.hwnd, win32con.WM_CLOSE, 0, 0)
+
+    # -- runs on the tray thread --------------------------------------------
+    def _run(self):
+        import win32api, win32con, win32gui
+
+        wc = win32gui.WNDCLASS()
+        wc.hInstance = win32api.GetModuleHandle(None)
+        wc.lpszClassName = "SnipSquiggleTray"
+        wc.lpfnWndProc = self._wndproc
+        class_atom = win32gui.RegisterClass(wc)
+        self.hwnd = win32gui.CreateWindow(class_atom, "SnipSquiggle", 0,
+                                          0, 0, 0, 0, 0, 0, wc.hInstance, None)
+        win32gui.UpdateWindow(self.hwnd)
+
+        self._add_icon()
+
+        # PrintScreen (VK_SNAPSHOT), no modifiers. May fail if another app or
+        # the Windows 11 "Print screen opens Snipping Tool" setting owns it.
+        try:
+            win32gui.RegisterHotKey(self.hwnd, self.HOTKEY_ID, 0,
+                                    win32con.VK_SNAPSHOT)
+            _log("PrintScreen hotkey registered — press PrintScreen to snip.")
+        except win32gui.error as e:
+            _log(f"Could NOT register PrintScreen hotkey ({e}); "
+                 "another app or Windows owns the key. Use the tray icon.")
+            self.events.put("hotkey_failed")
+
+        win32gui.PumpMessages()
+
+    def _add_icon(self):
+        import win32con, win32gui
+        try:
+            hicon = win32gui.LoadImage(0, self.icon_path, win32con.IMAGE_ICON,
+                                       0, 0, win32con.LR_LOADFROMFILE)
+        except Exception:
+            hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+        flags = win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP
+        nid = (self.hwnd, 0, flags, self._WM_TRAY, hicon,
+               "SnipSquiggle — press PrintScreen to snip")
+        win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        import win32api, win32con, win32gui
+        if msg == win32con.WM_HOTKEY and wparam == self.HOTKEY_ID:
+            self.events.put("snip")
+            return 0
+        if msg == self._WM_TRAY:
+            if lparam == win32con.WM_LBUTTONDBLCLK:
+                self.events.put("snip")
+            elif lparam == win32con.WM_RBUTTONUP:
+                self._show_menu()
+            return 0
+        if msg == win32con.WM_COMMAND:
+            cid = win32api.LOWORD(wparam)
+            if cid == self.ID_SNIP:
+                self.events.put("snip")
+            elif cid == self.ID_QUIT:
+                self.events.put("quit")
+            return 0
+        if msg == win32con.WM_DESTROY:
+            try:
+                win32gui.UnregisterHotKey(hwnd, self.HOTKEY_ID)
+            except win32gui.error:
+                pass
+            win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (hwnd, 0))
+            win32gui.PostQuitMessage(0)
+            return 0
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def _show_menu(self):
+        import win32con, win32gui
+        menu = win32gui.CreatePopupMenu()
+        win32gui.AppendMenu(menu, win32con.MF_STRING, self.ID_SNIP, "Snip now")
+        win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, self.ID_QUIT, "Quit")
+        x, y = win32gui.GetCursorPos()
+        win32gui.SetForegroundWindow(self.hwnd)   # so the menu auto-dismisses
+        win32gui.TrackPopupMenu(menu, win32con.TPM_RIGHTALIGN | win32con.TPM_BOTTOMALIGN,
+                                x, y, 0, self.hwnd, None)
+        win32gui.PostMessage(self.hwnd, win32con.WM_NULL, 0, 0)
 
 
 # ===========================================================================
 # App controller
 # ===========================================================================
 class App:
-    def __init__(self):
+    def __init__(self, resident=False):
         self.root = tk.Tk()
         self.root.withdraw()
+        self.resident = resident and IS_WIN
+        self.busy = False          # an overlay or editor is currently open
+        self.tray = None
+
+        if resident and not IS_WIN:
+            sys.stderr.write("--tray (PrintScreen hotkey) is Windows-only; "
+                             "running a single snip instead.\n")
+
+        if self.resident:
+            _log("Tray mode started; sitting idle. Right-click the tray icon "
+                 "for options.")
+            self.events = queue.Queue()
+            self.tray = WinTray(self.events)
+            self.tray.start()
+            self._poll_events()    # sit idle until PrintScreen / tray triggers
+        else:
+            self.start_capture()
+
+    # -- resident event pump (Tk thread) ------------------------------------
+    def _poll_events(self):
+        try:
+            while True:
+                ev = self.events.get_nowait()
+                _log(f"event: {ev}" + (" (ignored, snip in progress)"
+                                       if ev == "snip" and self.busy else ""))
+                if ev == "snip":
+                    self.request_capture()
+                elif ev == "quit":
+                    self._shutdown()
+                    return
+                elif ev == "hotkey_failed":
+                    self._warn_hotkey_failed()
+        except queue.Empty:
+            pass
+        self.root.after(80, self._poll_events)
+
+    def request_capture(self):
+        if self.busy:              # ignore repeat presses mid-snip
+            return
+        self.busy = True
         self.start_capture()
 
+    def _warn_hotkey_failed(self):
+        messagebox.showwarning(
+            "SnipSquiggle",
+            "Couldn't grab the PrintScreen key — another app (often the "
+            "Windows 11 \"Use Print screen to open Snipping Tool\" setting) "
+            "already owns it.\n\n"
+            "Turn that off under Settings → Accessibility → Keyboard, "
+            "then restart SnipSquiggle. You can still snip from the tray icon.")
+
+    def _shutdown(self):
+        if self.tray:
+            self.tray.stop()
+        self.root.quit()
+
+    # -- capture / edit flow ------------------------------------------------
     def start_capture(self):
         self.root.after(120, self._do_capture)
 
@@ -1130,9 +1319,16 @@ class App:
 
     def _captured(self, image):
         if image is None:
-            self.root.quit()
+            self._finish()
             return
-        Editor(self.root, image, self.start_capture)
+        Editor(self.root, image, self.start_capture, self._finish)
+
+    def _finish(self):
+        """A snip cycle ended (cancelled or editor closed)."""
+        if self.resident:
+            self.busy = False      # back to idle, tray + hotkey still live
+        else:
+            self.root.quit()
 
     def run(self):
         self.root.mainloop()
@@ -1153,4 +1349,5 @@ def _check_tk():
 
 if __name__ == "__main__":
     _check_tk()
-    App().run()
+    resident = "--tray" in sys.argv or "--resident" in sys.argv
+    App(resident=resident).run()
