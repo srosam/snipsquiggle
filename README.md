@@ -36,6 +36,60 @@ python snipsquiggle.py
 `requirements.txt` installs the right OS extras automatically
 (`pywin32` on Windows, `pyobjc-framework-Cocoa` on macOS; nothing extra on Linux).
 
+> **On macOS, do the one-time setup below first** — the system Python won't work.
+
+## macOS setup (step by step)
+
+The app is a Tk GUI, so it needs a Python built against **Tk 8.6**. The two
+Pythons already on most Macs do **not** work:
+
+- **Apple's Command Line Tools `python3`** links against **Tk 8.5**, which
+  segfaults GUI apps ("Python quit unexpectedly").
+- **Homebrew `python-tk`** pulls in **Tk 9.0**, whose bottle can require a newer
+  macOS than you're running (`macOS 26 … required, have instead 16` → abort).
+
+The reliable fix is the **official python.org installer**, which bundles its own
+Tk 8.6 and runs on macOS 10.13+:
+
+1. **Install Python from python.org.**
+   Download the latest **“macOS 64-bit universal2 installer”** from
+   <https://www.python.org/downloads/macos/> and run it. Works on Apple Silicon
+   and Intel.
+
+2. **Verify you have Tk 8.6** (this must print `8.6` and *not* abort):
+   ```sh
+   /usr/local/bin/python3 -c "import tkinter; print(tkinter.TkVersion)"
+   ```
+   > If `/usr/local/bin/python3` isn't found, use the full framework path, e.g.
+   > `/Library/Frameworks/Python.framework/Versions/3.13/bin/python3`.
+
+3. **Install dependencies and run** with *that* interpreter:
+   ```sh
+   cd snipsquiggle
+   /usr/local/bin/python3 -m pip install -r requirements.txt
+   /usr/local/bin/python3 snipsquiggle.py
+   ```
+
+4. **Grant Screen Recording permission** (first run only). macOS will prompt, or:
+   System Settings → Privacy & Security → **Screen Recording** → enable your
+   **Terminal** (or iTerm). Then **quit and reopen the terminal** — the
+   permission only takes effect after a relaunch — and run step 3 again.
+   Without it, snips come back as the desktop wallpaper only.
+
+That's it. To avoid typing the long path, add an alias to `~/.zshrc`:
+```sh
+alias py='/usr/local/bin/python3'
+# then:  py snipsquiggle.py
+```
+
+Notes:
+- On Retina displays the snip is captured at 2× pixels, so the editor window can
+  look large — that's expected; the exported GIF is crisp.
+- Emoji use **Apple Color Emoji**. For emoji that look identical to Windows,
+  drop a `NotoColorEmoji.ttf` into an `assets/` folder (see Platform notes).
+- The app checks your Tk version at startup and exits with these instructions if
+  it's too old, instead of crashing.
+
 ## Shortcuts (in the editor)
 
 Use **Ctrl** on Windows/Linux, **Cmd** on macOS.
@@ -50,21 +104,8 @@ Use **Ctrl** on Windows/Linux, **Cmd** on macOS.
 
 ## Platform notes
 
-- **macOS**
-  - **Needs Tk 8.6+.** Apple's built-in `python3` (Command Line Tools) uses the
-    old **Tk 8.5**, which crashes GUI apps. Use a Python with modern Tk:
-    ```sh
-    brew install python-tk
-    "$(brew --prefix)/bin/python3" snipsquiggle.py
-    ```
-    (or install Python from [python.org](https://www.python.org), which bundles
-    Tk 8.6). Check with `python3 -c "import tkinter; print(tkinter.TkVersion)"`.
-  - First run needs **Screen Recording** permission (System Settings →
-    Privacy & Security → Screen Recording) for the capture to contain window
-    contents; grant it to your terminal / the built app, then relaunch.
-  - On Retina displays the snip is captured at 2× pixels, so the editor window
-    can be large — that's expected; the GIF is crisp.
-  - Emoji use **Apple Color Emoji**.
+- **macOS** — see [macOS setup](#macos-setup-step-by-step) above (needs Tk 8.6
+  via the python.org installer + Screen Recording permission).
 - **Linux**
   - Copying needs `xclip` (X11) or `wl-clipboard` (Wayland) installed; without
     them the GIF is still saved via **Save**.

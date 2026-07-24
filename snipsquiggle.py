@@ -63,6 +63,22 @@ JITTER_BASE = 1.8     # base wobble amplitude (px)
 PALETTE = ["#ff3b30", "#ffcc00", "#34c759", "#0a84ff", "#000000", "#ffffff"]
 EMOJIS = ["🔥", "❤️", "⭐", "✅", "👍", "😂", "🎉", "➡️", "💯", "👀"]
 
+# tk.Button ignores bg/fg on macOS (native Aqua button), so we build toolbar
+# controls from Labels, which honor colors on every platform.
+UI_FONT = ("Segoe UI", 9) if IS_WIN else ("Helvetica", 12)
+EMOJI_UI_FONT = ("Segoe UI Emoji", 12) if IS_WIN else ("Helvetica", 15)
+BTN_BG = "#2d2d2d"
+BTN_SEL = "#0a84ff"
+
+
+def _lighten(hexstr, amt=0.16):
+    hexstr = hexstr.lstrip("#")
+    r, g, b = (int(hexstr[i:i + 2], 16) for i in (0, 2, 4))
+    r = int(r + (255 - r) * amt)
+    g = int(g + (255 - g) * amt)
+    b = int(b + (255 - b) * amt)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
 
 # ---------------------------------------------------------------------------
 # Geometry helpers
@@ -625,13 +641,22 @@ class Editor:
         self._tick()
 
     # -- toolbar ------------------------------------------------------------
-    def _btn(self, parent, text, cmd, **kw):
-        b = tk.Button(parent, text=text, command=cmd, relief="flat",
-                      bg="#2d2d2d", fg="white", activebackground="#3d3d3d",
-                      activeforeground="white", bd=0, padx=10, pady=4,
-                      font=("Segoe UI", 9), **kw)
+    def _btn(self, parent, text, cmd, base=BTN_BG, fg="white", font=None,
+             padx=10, pady=4):
+        # A Label styled as a button (colors work on macOS; tk.Button doesn't).
+        b = tk.Label(parent, text=text, bg=base, fg=fg, padx=padx, pady=pady,
+                     font=font or UI_FONT, cursor="hand2")
+        b._basebg = base
+        b.bind("<Button-1>", lambda e: cmd())
+        b.bind("<Enter>", lambda e: b.configure(bg=_lighten(b._basebg)))
+        b.bind("<Leave>", lambda e: b.configure(bg=b._basebg))
         b.pack(side="left", padx=2)
         return b
+
+    @staticmethod
+    def _set_sel(widget, selected):
+        widget._basebg = BTN_SEL if selected else BTN_BG
+        widget.configure(bg=widget._basebg)
 
     def _sep(self, parent):
         tk.Frame(parent, width=1, bg="#444").pack(side="left", fill="y", padx=6)
@@ -649,9 +674,14 @@ class Editor:
         for name, label in (("pen", "✎ Pen"), ("arrow", "↗ Arrow"), ("box", "▭ Box")):
             self.tool_btns[name] = self._btn(bar, label, lambda n=name: self.set_tool(n))
         self._sep(bar)
+        self.swatches = {}
         for c in PALETTE:
-            tk.Button(bar, bg=c, width=2, relief="flat", bd=1,
-                      command=lambda cc=c: self.set_color(cc)).pack(side="left", padx=1)
+            sw = tk.Frame(bar, bg=c, width=22, height=22, cursor="hand2",
+                          highlightbackground="#555", highlightthickness=1)
+            sw.pack_propagate(False)
+            sw.bind("<Button-1>", lambda e, cc=c: self.set_color(cc))
+            sw.pack(side="left", padx=1)
+            self.swatches[c] = sw
         self._btn(bar, "＋", self.pick_color)
         self._sep(bar)
         for w, lbl in ((3, "S"), (5, "M"), (9, "L"), (14, "XL")):
@@ -664,12 +694,9 @@ class Editor:
         right.pack(side="right")
         self._btn(right, f"＋ New ({mod}+N)", self.new_snip)
         self._btn(right, f"💾 Save ({mod}+S)", self.save_gif)
-        self.copy_btn = tk.Button(right, text=f"📋 Copy GIF ({mod}+C)",
-                                  command=self.copy_gif, relief="flat",
-                                  bg="#0a84ff", fg="white", bd=0, padx=12, pady=4,
-                                  font=("Segoe UI", 9, "bold"),
-                                  activebackground="#0060df", activeforeground="white")
-        self.copy_btn.pack(side="left", padx=2)
+        self.copy_btn = self._btn(right, f"📋 Copy GIF ({mod}+C)", self.copy_gif,
+                                  base=BTN_SEL, padx=12,
+                                  font=(UI_FONT[0], UI_FONT[1], "bold"))
 
         bar2 = tk.Frame(self.win, bg="#1e1e1e")
         bar2.pack(fill="x", padx=10, pady=(0, 6))
@@ -681,22 +708,23 @@ class Editor:
         self._sep(bar2)
         self.emoji_btns = {}
         for ch in EMOJIS:
-            b = tk.Button(bar2, text=ch, command=lambda c=ch: self.set_emoji(c),
-                          relief="flat", bg="#2d2d2d", bd=0, padx=4, pady=2,
-                          font=("Segoe UI Emoji", 12))
-            b.pack(side="left", padx=1)
-            self.emoji_btns[ch] = b
+            self.emoji_btns[ch] = self._btn(bar2, ch,
+                                            lambda c=ch: self.set_emoji(c),
+                                            font=EMOJI_UI_FONT, padx=5, pady=2)
 
         self._refresh_btns()
 
     def _refresh_btns(self):
         for name, b in self.tool_btns.items():
-            b.configure(bg="#0a84ff" if name == self.tool else "#2d2d2d")
+            self._set_sel(b, name == self.tool)
         for name, b in self.anim_btns.items():
-            b.configure(bg="#0a84ff" if name == self.anim else "#2d2d2d")
+            self._set_sel(b, name == self.anim)
         for ch, b in self.emoji_btns.items():
-            on = (self.anim == "emoji" and ch == self.emoji)
-            b.configure(bg="#0a84ff" if on else "#2d2d2d")
+            self._set_sel(b, self.anim == "emoji" and ch == self.emoji)
+        for c, sw in getattr(self, "swatches", {}).items():
+            sel = (c == self.color)
+            sw.configure(highlightbackground="#ffffff" if sel else "#555",
+                         highlightthickness=2 if sel else 1)
 
     def set_tool(self, name):
         self.tool = name
@@ -713,11 +741,13 @@ class Editor:
 
     def set_color(self, c):
         self.color = c
+        self._refresh_btns()
 
     def pick_color(self):
         c = colorchooser.askcolor(color=self.color, parent=self.win)[1]
         if c:
             self.color = c
+            self._refresh_btns()
 
     def set_width(self, w):
         self.width = w
