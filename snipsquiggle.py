@@ -209,7 +209,8 @@ def emoji_image(char, px):
     key = (char, px)
     if key in _EMOJI_CACHE:
         return _EMOJI_CACHE[key]
-    box = int(px * 1.3)
+    # Render on an oversized canvas so nothing clips, then crop to the glyph.
+    box = int(px * 2)
     img = Image.new("RGBA", (box, box), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     try:
@@ -218,6 +219,9 @@ def emoji_image(char, px):
     except Exception:
         d.text((box / 2, box / 2), char, font=emoji_font(px),
                anchor="mm", fill=(0, 0, 0, 255))
+    bbox = img.getbbox()
+    if bbox:
+        img = img.crop(bbox)
     _EMOJI_CACHE[key] = img
     return img
 
