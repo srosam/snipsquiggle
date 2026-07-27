@@ -10,7 +10,8 @@ It checks, and prints PASS/FAIL for, each of:
   1. Platform + PyObjC availability
   2. Color-emoji rasterisation (Apple Color Emoji, incl. the tricky arrow glyph)
   3. Animated-GIF build (the shared engine)
-  4. Clipboard: write the GIF via NSPasteboard, then read it back
+  4. Clipboard: write the GIF via NSPasteboard, then read it back, plus the
+     instant static-image copy used right after a snip
   5. (optional) Non-interactive screen capture -> checks Screen Recording perm
   6. (optional) Interactive snip via the real capture path
 
@@ -95,6 +96,16 @@ def main():
         check("clipboard: GIF present on NSPasteboard", has_gif, f"types={types}")
     except Exception as e:
         check("clipboard write/read", False, str(e))
+
+    # 4b) clipboard: the instant static-snip copy
+    try:
+        ss.set_clipboard_image(Image.new("RGB", (64, 32), (11, 200, 99)))
+        from AppKit import NSPasteboard
+        types = [str(t) for t in NSPasteboard.generalPasteboard().types()]
+        check("clipboard: static PNG present on NSPasteboard",
+              any("png" in t.lower() for t in types), f"types={types}")
+    except Exception as e:
+        check("clipboard: static PNG present on NSPasteboard", False, str(e))
 
     # 5) optional: non-interactive capture (verifies Screen Recording permission)
     if _ask("\nRun a non-interactive full-screen capture test? [y/N] "):

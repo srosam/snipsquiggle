@@ -4,15 +4,23 @@ SnipSquiggle - a Snipping-Tool-style capture + animated annotation app.
 Cross-platform (Windows fully tested; macOS/Linux paths included).
 
 Run modes:
-  Default            One-shot: launch -> snip -> edit -> exit.
-  --tray  (Windows)  Resident: sits in the system tray and snips whenever you
-                     press PrintScreen. Right-click the tray icon to snip or
-                     quit; the editor closing returns to idle instead of exiting.
+  Default           One-shot: launch -> snip -> edit -> exit.
+  --tray            Resident: stays in the tray / menu bar and snips on a
+                    global hotkey. Windows: system tray, PrintScreen.
+                    macOS: menu-bar icon, Cmd+Shift+2 (macOS has no PrintScreen
+                    and reserves Cmd+Shift+3/4/5). The icon's menu snips or
+                    quits; closing the editor returns to idle instead of exiting.
+                    The hotkey also works while the editor is open — it replaces
+                    the current snip with a new one.
+                    (Linux tray/hotkey not implemented — falls back to one-shot.)
+  --no-copy         Don't put the plain snip on the clipboard automatically.
 
 Flow:
-  1. Launch (or press PrintScreen in --tray mode) -> select a region to snip.
+  1. Launch (or press the hotkey in --tray mode) -> select a region to snip.
        Windows/Linux: a dimmed overlay, drag a rectangle (Esc cancels).
        macOS:         the native `screencapture -i` crosshair.
+  1b. The plain snip lands on the clipboard immediately as a static image, so
+      you can paste right away without annotating (--no-copy disables this).
   2. Editor opens with your snip. Draw with pen / arrow / box, and pick an
      animation style per stroke:
         Boil  - hand-drawn squiggle that gently wobbles (default)
@@ -478,6 +486,25 @@ def set_clipboard(gif_path, static_frame):
         _clip_linux(gif_path, static_frame)
 
 
+def set_clipboard_image(image):
+    """Put a plain static image on the clipboard (no GIF, no file reference).
+
+    Used right after a snip so the raw screenshot is pasteable immediately.
+    """
+    if IS_WIN:
+        _clip_image_win(image)
+    elif IS_MAC:
+        _clip_image_mac(image)
+    else:
+        _clip_image_linux(image)
+
+
+def _png_bytes(im):
+    buf = io.BytesIO()
+    im.convert("RGB").save(buf, "PNG")
+    return buf.getvalue()
+
+
 if IS_WIN:
     from ctypes import wintypes
 
@@ -520,15 +547,7 @@ if IS_WIN:
         im.convert("RGB").save(buf, "BMP")
         return buf.getvalue()[14:]  # strip BITMAPFILEHEADER -> CF_DIB
 
-    def _clip_win(gif_path, static_frame):
-        cf_gif = _u32.RegisterClipboardFormatW("GIF")
-        with open(gif_path, "rb") as f:
-            gif_bytes = f.read()
-        payloads = {
-            _CF_HDROP: _hdrop_bytes([gif_path]),
-            _CF_DIB: _dib_bytes(static_frame),
-            cf_gif: gif_bytes,
-        }
+    def _put_formats(payloads):
         if not _u32.OpenClipboard(None):
             raise OSError("Could not open clipboard")
         try:
@@ -537,6 +556,22 @@ if IS_WIN:
                 _u32.SetClipboardData(fmt, _global_from_bytes(data))
         finally:
             _u32.CloseClipboard()
+
+    def _clip_win(gif_path, static_frame):
+        cf_gif = _u32.RegisterClipboardFormatW("GIF")
+        with open(gif_path, "rb") as f:
+            gif_bytes = f.read()
+        _put_formats({
+            _CF_HDROP: _hdrop_bytes([gif_path]),
+            _CF_DIB: _dib_bytes(static_frame),
+            cf_gif: gif_bytes,
+        })
+
+    def _clip_image_win(im):
+        # CF_DIB is the universal bitmap format; "PNG" is what browsers and
+        # newer editors reach for first.
+        cf_png = _u32.RegisterClipboardFormatW("PNG")
+        _put_formats({_CF_DIB: _dib_bytes(im), cf_png: _png_bytes(im)})
 
 
 def _clip_mac(gif_path, static_frame):
@@ -562,6 +597,20 @@ def _clip_mac(gif_path, static_frame):
         raise OSError("NSPasteboard writeObjects failed")
 
 
+def _clip_image_mac(im):
+    from AppKit import NSPasteboard, NSPasteboardItem
+    from Foundation import NSData
+
+    png = _png_bytes(im)
+    pb = NSPasteboard.generalPasteboard()
+    pb.clearContents()
+    item = NSPasteboardItem.alloc().init()
+    item.setData_forType_(NSData.dataWithBytes_length_(png, len(png)),
+                          "public.png")
+    if not pb.writeObjects_([item]):
+        raise OSError("NSPasteboard writeObjects failed")
+
+
 def _clip_linux(gif_path, static_frame):
     import shutil
     with open(gif_path, "rb") as f:
@@ -575,6 +624,20 @@ def _clip_linux(gif_path, static_frame):
         return
     raise OSError("No clipboard tool found. Install 'xclip' (X11) or "
                   "'wl-clipboard' (Wayland). The GIF was still saved.")
+
+
+def _clip_image_linux(im):
+    import shutil
+    png = _png_bytes(im)
+    if shutil.which("xclip"):
+        subprocess.run(["xclip", "-selection", "clipboard", "-t", "image/png"],
+                       input=png, check=True)
+        return
+    if shutil.which("wl-copy"):
+        subprocess.run(["wl-copy", "--type", "image/png"], input=png, check=True)
+        return
+    raise OSError("No clipboard tool found. Install 'xclip' (X11) or "
+                  "'wl-clipboard' (Wayland).")
 
 
 # ===========================================================================
@@ -683,7 +746,8 @@ class OverlayCapture:
 # Editor
 # ===========================================================================
 class Editor:
-    def __init__(self, root, image, new_snip_cb, on_close=None):
+    def __init__(self, root, image, new_snip_cb, on_close=None,
+                 static_copied=False):
         self.root = root
         self.image = image.convert("RGB")
         self.new_snip_cb = new_snip_cb
@@ -702,6 +766,8 @@ class Editor:
         self._emoji_photos = {}
         self.watermark = None      # see load_watermark() for shape
         self._wm_drag = None       # (dx, dy) offset while dragging the logo
+        self._closed = False
+        self._tick_id = None
 
         self.win = tk.Toplevel(root)
         self.win.title("SnipSquiggle")
@@ -709,6 +775,8 @@ class Editor:
         self.win.protocol("WM_DELETE_WINDOW", self._quit)
 
         self._build_toolbar()
+        if static_copied:
+            self._toast("📋 Screenshot copied — paste it, or annotate below")
 
         self.tkimg = ImageTk.PhotoImage(self.image)
         self.canvas = tk.Canvas(self.win, width=self.image.width,
@@ -733,6 +801,13 @@ class Editor:
         self.win.bind(f"<{mod}-z>", lambda e: self.undo())
         self.win.bind(f"<{mod}-n>", lambda e: self.new_snip())
         self.win.bind("<Escape>", lambda e: self._quit())
+
+        # PrintScreen while the editor is focused starts a fresh snip. In tray
+        # mode the global hotkey claims the key before it reaches us and does
+        # the same thing; this covers one-shot mode (and a failed registration).
+        # Windows only delivers PrintScreen on key *release*, so bind both.
+        for seq in ("<Key-Print>", "<KeyRelease-Print>"):
+            self.win.bind(seq, lambda e: self.new_snip())
 
         self.win.after(200, self.win.focus_force)
         self._tick()
@@ -812,6 +887,10 @@ class Editor:
             self.emoji_btns[ch] = self._btn(bar2, ch,
                                             lambda c=ch: self.set_emoji(c),
                                             font=EMOJI_UI_FONT, padx=5, pady=2)
+
+        self.status = tk.Label(bar2, text="", bg="#1e1e1e", fg="#4cd964",
+                               font=UI_FONT)
+        self.status.pack(side="right", padx=(6, 2))
 
         self._refresh_btns()
 
@@ -1020,6 +1099,8 @@ class Editor:
         return self._emoji_photos[key]
 
     def _tick(self):
+        if self._closed:
+            return
         self.frame = (self.frame + 1) % N_FRAMES
         self.canvas.delete("stroke")
         if self.watermark:
@@ -1043,7 +1124,7 @@ class Editor:
                     _, x, y, char, px = op
                     self.canvas.create_image(x, y, image=self._emoji_photo(char, px),
                                              tags="stroke")
-        self.win.after(FRAME_MS, self._tick)
+        self._tick_id = self.win.after(FRAME_MS, self._tick)
 
     # -- gif rendering ------------------------------------------------------
     def _render_frames(self):
@@ -1107,15 +1188,44 @@ class Editor:
     def _flash(self, btn, text, ms=1200):
         old = btn["text"]
         btn.configure(text=text)
-        btn.after(ms, lambda: btn.configure(text=old))
+        btn.after(ms, lambda: self._restore(btn, old))
+
+    def _toast(self, text, ms=4000):
+        """Transient message in the toolbar's status slot."""
+        self.status.configure(text=text)
+        self.status.after(ms, lambda: self._restore(self.status, ""))
+
+    def _restore(self, widget, text):
+        if not self._closed:      # the window may be gone by now
+            widget.configure(text=text)
 
     # -- lifecycle ----------------------------------------------------------
     def new_snip(self):
-        self.win.destroy()
+        # The controller owns the teardown (it has to know an editor is going
+        # away), so just ask it for a new snip — it calls discard() on us.
         self.new_snip_cb()
 
-    def _quit(self):
+    def discard(self):
+        """Close without firing on_close — the controller is replacing us."""
+        self._teardown()
+
+    def _teardown(self):
+        """Stop the animation loop, then destroy the window.
+
+        The loop must be cancelled first: a pending ``after`` callback outlives
+        ``destroy()`` and would blow up on the dead canvas (harmless in one-shot
+        mode where the mainloop exits too, fatal-looking in tray mode)."""
+        self._closed = True
+        if self._tick_id is not None:
+            try:
+                self.win.after_cancel(self._tick_id)
+            except Exception:
+                pass
+            self._tick_id = None
         self.win.destroy()
+
+    def _quit(self):
+        self._teardown()
         self.on_close()
 
 
@@ -1126,9 +1236,19 @@ ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
 
 
 def _log(msg):
-    """Diagnostics for tray mode (visible when launched from a console)."""
-    sys.stderr.write(f"[SnipSquiggle] {msg}\n")
-    sys.stderr.flush()
+    """Diagnostics for tray mode (visible when launched from a console).
+
+    Under pythonw.exe there is no console, so sys.stderr is None — writing to
+    it would raise and abort tray startup. Degrade to a no-op in that case.
+    """
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        stream.write(f"[SnipSquiggle] {msg}\n")
+        stream.flush()
+    except (OSError, ValueError):
+        pass
 
 
 class WinTray:
@@ -1244,38 +1364,185 @@ class WinTray:
         win32gui.PostMessage(self.hwnd, win32con.WM_NULL, 0, 0)
 
 
+class MacTray:
+    """A menu-bar icon plus a global hotkey (macOS only).
+
+    Unlike WinTray this spawns NO thread: Cocoa objects (NSStatusItem) and the
+    Carbon hotkey handler must live on the main thread and be serviced by the
+    main run loop — which tkinter's ``mainloop`` already pumps on macOS. So we
+    just install everything on the calling (main) thread and, like WinTray,
+    push events onto the shared queue for ``App._poll_events`` to drain.
+
+    macOS has no PrintScreen key and reserves Cmd+Shift+3/4/5 for its own
+    screenshots, so the default combo here is **Cmd+Shift+2**.
+
+    Queue messages: "snip", "quit", "hotkey_failed".
+    """
+
+    KEYCODE = 0x13                    # kVK_ANSI_2
+    MODIFIERS = 0x0100 | 0x0200       # cmdKey | shiftKey
+    HOTKEY_LABEL = "⌘⇧2"    # ⌘⇧2
+
+    def __init__(self, events):
+        self.events = events
+        self._status_item = None
+        self._delegate = None
+        self._carbon = None
+        self._hk_ref = ctypes.c_void_p()
+        self._handler_ref = ctypes.c_void_p()
+        self._hk_callback = None      # keep the CFUNCTYPE alive (else GC'd)
+
+    def start(self):
+        try:
+            self._install_menubar()
+        except Exception as e:               # menu bar is nice-to-have
+            _log(f"macOS: menu-bar icon failed ({e}); hotkey still active.")
+        self._install_hotkey()
+
+    def stop(self):
+        try:
+            if self._status_item is not None:
+                from AppKit import NSStatusBar
+                NSStatusBar.systemStatusBar().removeStatusItem_(self._status_item)
+        except Exception:
+            pass
+        try:
+            if self._carbon is not None and self._hk_ref:
+                self._carbon.UnregisterEventHotKey(self._hk_ref)
+        except Exception:
+            pass
+
+    # -- menu bar (Cocoa) ---------------------------------------------------
+    def _install_menubar(self):
+        from AppKit import (NSStatusBar, NSMenu, NSMenuItem,
+                            NSVariableStatusItemLength)
+        from Foundation import NSObject
+
+        events = self.events
+
+        class _Delegate(NSObject):
+            def snip_(self, sender):
+                events.put("snip")
+
+            def quitApp_(self, sender):
+                events.put("quit")
+
+        self._delegate = _Delegate.alloc().init()
+
+        item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+            NSVariableStatusItemLength)
+        try:
+            item.button().setTitle_("\U0001f4a7")   # 💧 (matches the logo)
+        except Exception:
+            item.setTitle_("\U0001f4a7")
+
+        menu = NSMenu.alloc().init()
+        snip = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            f"Snip now ({self.HOTKEY_LABEL})", "snip:", "")
+        snip.setTarget_(self._delegate)
+        menu.addItem_(snip)
+        menu.addItem_(NSMenuItem.separatorItem())
+        quit_ = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Quit SnipSquiggle", "quitApp:", "")
+        quit_.setTarget_(self._delegate)
+        menu.addItem_(quit_)
+        item.setMenu_(menu)
+        self._status_item = item
+
+    # -- global hotkey (Carbon via ctypes) ----------------------------------
+    def _install_hotkey(self):
+        import ctypes.util
+
+        carbon = ctypes.CDLL(ctypes.util.find_library("Carbon"))
+        self._carbon = carbon
+
+        class EventTypeSpec(ctypes.Structure):
+            _fields_ = [("eventClass", ctypes.c_uint32),
+                        ("eventKind", ctypes.c_uint32)]
+
+        class EventHotKeyID(ctypes.Structure):
+            _fields_ = [("signature", ctypes.c_uint32), ("id", ctypes.c_uint32)]
+
+        HANDLER = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p,
+                                   ctypes.c_void_p, ctypes.c_void_p)
+
+        carbon.GetApplicationEventTarget.restype = ctypes.c_void_p
+        carbon.InstallEventHandler.argtypes = [
+            ctypes.c_void_p, HANDLER, ctypes.c_uint32,
+            ctypes.POINTER(EventTypeSpec), ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p)]
+        carbon.InstallEventHandler.restype = ctypes.c_int32
+        carbon.RegisterEventHotKey.argtypes = [
+            ctypes.c_uint32, ctypes.c_uint32, EventHotKeyID,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+        carbon.RegisterEventHotKey.restype = ctypes.c_int32
+        carbon.UnregisterEventHotKey.argtypes = [ctypes.c_void_p]
+        carbon.UnregisterEventHotKey.restype = ctypes.c_int32
+
+        events = self.events
+
+        def _on_hotkey(next_handler, event, user_data):
+            events.put("snip")
+            return 0                      # noErr
+
+        self._hk_callback = HANDLER(_on_hotkey)
+
+        target = carbon.GetApplicationEventTarget()
+        spec = EventTypeSpec(0x6b657962, 5)   # kEventClassKeyboard, ...HotKeyPressed
+        err = carbon.InstallEventHandler(target, self._hk_callback, 1,
+                                         ctypes.byref(spec), None,
+                                         ctypes.byref(self._handler_ref))
+        if err != 0:
+            _log(f"macOS: InstallEventHandler failed ({err}).")
+            self.events.put("hotkey_failed")
+            return
+
+        hk_id = EventHotKeyID(0x736e6970, 1)  # 'snip', 1
+        err = carbon.RegisterEventHotKey(self.KEYCODE, self.MODIFIERS, hk_id,
+                                         target, 0, ctypes.byref(self._hk_ref))
+        if err != 0:
+            _log(f"macOS: RegisterEventHotKey failed ({err}); "
+                 f"{self.HOTKEY_LABEL} may be taken by another app.")
+            self.events.put("hotkey_failed")
+        else:
+            _log(f"macOS: global hotkey {self.HOTKEY_LABEL} registered.")
+
+
 # ===========================================================================
 # App controller
 # ===========================================================================
 class App:
-    def __init__(self, resident=False):
+    def __init__(self, resident=False, auto_copy=True):
         self.root = tk.Tk()
         self.root.withdraw()
-        self.resident = resident and IS_WIN
-        self.busy = False          # an overlay or editor is currently open
+        self.resident = resident and (IS_WIN or IS_MAC)
+        self.auto_copy = auto_copy  # copy the plain snip as soon as it's taken
+        self.state = "idle"        # idle | capturing | editing
+        self.editor = None         # the open Editor, if state == "editing"
         self.tray = None
 
-        if resident and not IS_WIN:
-            sys.stderr.write("--tray (PrintScreen hotkey) is Windows-only; "
+        if resident and IS_LINUX:
+            sys.stderr.write("--tray is only implemented on Windows and macOS; "
                              "running a single snip instead.\n")
 
         if self.resident:
-            _log("Tray mode started; sitting idle. Right-click the tray icon "
+            _log("Tray mode started; sitting idle. Use the tray/menu-bar icon "
                  "for options.")
             self.events = queue.Queue()
-            self.tray = WinTray(self.events)
+            self.tray = WinTray(self.events) if IS_WIN else MacTray(self.events)
             self.tray.start()
-            self._poll_events()    # sit idle until PrintScreen / tray triggers
+            self._poll_events()    # sit idle until the hotkey / tray triggers
         else:
-            self.start_capture()
+            self.request_capture()
 
     # -- resident event pump (Tk thread) ------------------------------------
     def _poll_events(self):
         try:
             while True:
                 ev = self.events.get_nowait()
-                _log(f"event: {ev}" + (" (ignored, snip in progress)"
-                                       if ev == "snip" and self.busy else ""))
+                _log(f"event: {ev}" + (" (ignored, region select in progress)"
+                                       if ev == "snip" and
+                                       self.state == "capturing" else ""))
                 if ev == "snip":
                     self.request_capture()
                 elif ev == "quit":
@@ -1288,19 +1555,34 @@ class App:
         self.root.after(80, self._poll_events)
 
     def request_capture(self):
-        if self.busy:              # ignore repeat presses mid-snip
+        """Single entry point for "snip now" — hotkey, tray menu, ＋ New, Ctrl+N.
+
+        An open editor is thrown away and replaced (same as ＋ New), so the
+        hotkey works while you're annotating. Presses during region select are
+        dropped: the overlay is already up and waiting for a drag.
+        """
+        if self.state == "capturing":
             return
-        self.busy = True
+        if self.editor is not None:
+            self.editor.discard()
+            self.editor = None
+        self.state = "capturing"
         self.start_capture()
 
     def _warn_hotkey_failed(self):
-        messagebox.showwarning(
-            "SnipSquiggle",
-            "Couldn't grab the PrintScreen key — another app (often the "
-            "Windows 11 \"Use Print screen to open Snipping Tool\" setting) "
-            "already owns it.\n\n"
-            "Turn that off under Settings → Accessibility → Keyboard, "
-            "then restart SnipSquiggle. You can still snip from the tray icon.")
+        if IS_MAC:
+            msg = ("Couldn't register the Cmd+Shift+2 hotkey — another app may "
+                   "already own it.\n\n"
+                   "You can still snip from the menu-bar icon, or change the "
+                   "combo (MacTray.KEYCODE / MODIFIERS) and restart.")
+        else:
+            msg = ("Couldn't grab the PrintScreen key — another app (often the "
+                   "Windows 11 \"Use Print screen to open Snipping Tool\" "
+                   "setting) already owns it.\n\n"
+                   "Turn that off under Settings → Accessibility → Keyboard, "
+                   "then restart SnipSquiggle. You can still snip from the "
+                   "tray icon.")
+        messagebox.showwarning("SnipSquiggle", msg)
 
     def _shutdown(self):
         if self.tray:
@@ -1321,13 +1603,28 @@ class App:
         if image is None:
             self._finish()
             return
-        Editor(self.root, image, self.start_capture, self._finish)
+        copied = self._copy_static(image)
+        self.state = "editing"
+        self.editor = Editor(self.root, image, self.request_capture,
+                             self._finish, static_copied=copied)
+
+    def _copy_static(self, image):
+        """Put the raw snip on the clipboard. Best effort — a clipboard failure
+        must not cost the user their snip, so it's logged, not raised."""
+        if not self.auto_copy:
+            return False
+        try:
+            set_clipboard_image(image)
+        except Exception as ex:
+            _log(f"auto-copy of the static snip failed: {ex}")
+            return False
+        return True
 
     def _finish(self):
         """A snip cycle ended (cancelled or editor closed)."""
-        if self.resident:
-            self.busy = False      # back to idle, tray + hotkey still live
-        else:
+        self.editor = None
+        self.state = "idle"       # resident: back to idle, tray + hotkey live
+        if not self.resident:
             self.root.quit()
 
     def run(self):
@@ -1350,4 +1647,5 @@ def _check_tk():
 if __name__ == "__main__":
     _check_tk()
     resident = "--tray" in sys.argv or "--resident" in sys.argv
-    App(resident=resident).run()
+    auto_copy = "--no-copy" not in sys.argv
+    App(resident=resident, auto_copy=auto_copy).run()

@@ -2,6 +2,8 @@
 
 A cross-platform Snipping-Tool clone where your annotations are **squiggly and
 animated**, and **Copy (Ctrl/Cmd+C) puts a looping GIF** on your clipboard.
+Every snip also lands on the clipboard as a plain static image the moment you
+take it, so it works as an ordinary screenshot tool too.
 
 Runs on **Windows** (fully tested), **macOS**, and **Linux**.
 
@@ -10,6 +12,10 @@ Runs on **Windows** (fully tested), **macOS**, and **Linux**.
 1. **Launch** → select a screen region to snip.
    - **Windows / Linux:** the screen dims — drag a rectangle (Esc cancels).
    - **macOS:** the native `screencapture` crosshair.
+
+   The plain snip goes **straight onto the clipboard as a static image**, so if
+   you only wanted a screenshot you can paste (Ctrl/Cmd+V) immediately and close
+   the editor. Pass `--no-copy` to turn this off.
 2. **Editor** opens with your snip. Draw with **Pen**, **Arrow**, or **Box**,
    and pick an **animation style** per stroke:
 
@@ -28,9 +34,10 @@ Runs on **Windows** (fully tested), **macOS**, and **Linux**.
    water **ripple**. **Drag** it to reposition; **scroll** the mouse wheel over
    it to resize; **🚫** removes it.
 
-3. **Copy (Ctrl/Cmd+C)** → a looping animated GIF is placed on the clipboard.
-   Pastes as an **animated file** into Slack / Discord / Teams / Finder /
-   Explorer, and as a **static image** into apps that only accept bitmaps.
+3. **Copy (Ctrl/Cmd+C)** → a looping animated GIF replaces the static snip on
+   the clipboard. Pastes as an **animated file** into Slack / Discord / Teams /
+   Finder / Explorer, and as a **static image** into apps that only accept
+   bitmaps.
 
 ## Run
 
@@ -44,22 +51,33 @@ python snipsquiggle.py
 
 > **On macOS, do the one-time setup below first** — the system Python won't work.
 
-### Tray mode — snip with PrintScreen (Windows)
+### Tray mode — snip with a global hotkey
 
 ```sh
 python snipsquiggle.py --tray
 ```
 
-Instead of snipping once and exiting, SnipSquiggle sits in the system tray and
-snips whenever you press **PrintScreen**. Right-click the tray icon for
-**Snip now** / **Quit**, or double-click it to snip. Closing the editor drops
-back to idle rather than quitting.
+Instead of snipping once and exiting, SnipSquiggle stays resident and snips on a
+global hotkey. Closing the editor drops back to idle rather than quitting.
 
-**Start in the tray automatically at login:**
+| | Hotkey | Icon lives in | Menu |
+|---|---|---|---|
+| **Windows** | **PrintScreen** | system tray | right-click / double-click |
+| **macOS** | **⌘⇧2** (Cmd+Shift+2) | menu bar | click the 💧 icon |
+
+macOS uses ⌘⇧2 because Mac keyboards have no PrintScreen key and the OS reserves
+⌘⇧3/4/5 for its own screenshots. (Change it via `MacTray.KEYCODE` / `MODIFIERS`.)
+
+**Start in the tray/menu bar automatically at login:**
 
 ```sh
-python create_shortcut.py --startup     # install (hidden, windowless)
-python create_shortcut.py --uninstall   # remove it again
+# Windows
+python create_shortcut.py --startup       # install (hidden, windowless)
+python create_shortcut.py --uninstall     # remove it again
+
+# macOS (run with your Tk 8.6 python — see setup below)
+python3 create_launchagent.py             # install (LaunchAgent, RunAtLoad)
+python3 create_launchagent.py --uninstall # remove it again
 ```
 
 > **Windows 11:** if PrintScreen does nothing, the built-in
@@ -67,6 +85,9 @@ python create_shortcut.py --uninstall   # remove it again
 > key. Turn it off under **Settings → Accessibility → Keyboard**, then restart
 > SnipSquiggle. (SnipSquiggle warns you if it couldn't grab the key.) You can
 > always snip from the tray icon regardless.
+>
+> **Only one app can own the hotkey at a time** — on Windows keep Greenshot and
+> similar tools closed; on macOS pick a combo nothing else uses.
 
 ## macOS setup (step by step)
 
@@ -130,7 +151,12 @@ Use **Ctrl** on Windows/Linux, **Cmd** on macOS.
 | `⌃/⌘ + S`   | Save GIF to disk    |
 | `⌃/⌘ + Z`   | Undo last stroke    |
 | `⌃/⌘ + N`   | New snip            |
+| `PrintScreen` | New snip (Windows/Linux — same as the global hotkey) |
 | `Esc`       | Quit                |
+
+The snip hotkey works **while the editor is open**: it throws the current snip
+away and starts a fresh region select, just like **＋ New**. (A press while the
+selection overlay is already up is ignored.)
 
 ## Platform notes
 
@@ -194,3 +220,9 @@ the way each platform's paste targets understand:
   `GIF` format.
 - **macOS** — `NSPasteboard` with `public.gif` + `public.png` data and a file URL.
 - **Linux** — `xclip` / `wl-copy` with the `image/gif` target.
+
+The instant static copy after a snip is the simpler sibling of that
+(`set_clipboard_image`): `CF_DIB` + a raw `PNG` format on Windows, `public.png`
+on macOS, `image/png` via `xclip`/`wl-copy` on Linux. It's best effort — if the
+clipboard is locked by another app, it's logged and the snip still opens in the
+editor.
