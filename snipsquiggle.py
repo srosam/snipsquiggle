@@ -80,7 +80,7 @@ RESAMPLE_SPACING = 7  # px between points before wobble
 JITTER_BASE = 1.8     # base wobble amplitude (px)
 
 PALETTE = ["#ff3b30", "#ffcc00", "#34c759", "#0a84ff", "#000000", "#ffffff"]
-EMOJIS = ["🔥", "❤️", "⭐", "✅", "👍", "😂", "🎉", "➡️", "💯", "👀"]
+EMOJIS = ["🔥", "❤️", "⭐", "✅", "👍", "😂", "🎉", "➡️", "💯", "👀", "😭", "🤬", "FFS", "💤"]
 
 # tk.Button ignores bg/fg on macOS (native Aqua button), so we build toolbar
 # controls from Labels, which honor colors on every platform.
