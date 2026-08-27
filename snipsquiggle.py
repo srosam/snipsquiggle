@@ -14,6 +14,8 @@ Run modes:
                     the current snip with a new one.
                     (Linux tray/hotkey not implemented — falls back to one-shot.)
   --no-copy         Don't put the plain snip on the clipboard automatically.
+  --no-save         Don't auto-save snips to disk.
+  --save-dir DIR    Where auto-saved snips go (default ~/Pictures/SnipSquiggle).
 
 Flow:
   1. Launch (or press the hotkey in --tray mode) -> select a region to snip.
@@ -21,6 +23,10 @@ Flow:
        macOS:         the native `screencapture -i` crosshair.
   1b. The plain snip lands on the clipboard immediately as a static image, so
       you can paste right away without annotating (--no-copy disables this).
+  1c. It is also written to disk immediately - before the editor even opens - as
+      ~/Pictures/SnipSquiggle/snip-<date>-<time>.png, so a capture can never be
+      lost. The editor header links to that file. Annotating writes a companion
+      "..._2.gif" beside it, rewritten in place as you keep drawing.
   2. Editor opens with your snip. Draw with pen / arrow / box, and pick an
      animation style per stroke:
         Boil  - hand-drawn squiggle that gently wobbles (default)
@@ -43,6 +49,7 @@ import os
 import sys
 import json
 import math
+import time
 import queue
 import bisect
 import random
@@ -88,6 +95,7 @@ UI_FONT = ("Segoe UI", 9) if IS_WIN else ("Helvetica", 12)
 EMOJI_UI_FONT = ("Segoe UI Emoji", 12) if IS_WIN else ("Helvetica", 15)
 BTN_BG = "#2d2d2d"
 BTN_SEL = "#0a84ff"
+LINK_FG = "#6fb2ff"
 
 
 def _lighten(hexstr, amt=0.16):
@@ -411,6 +419,68 @@ def add_recent_logo(path):
             json.dump(recent[:MAX_RECENT], f)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Auto-save. Every snip is written to disk the instant it is taken, before the
+# editor is even up, so a capture survives a crash, a stray Esc or a close.
+# Annotating produces a second file next to it with a "_2" suffix, rewritten in
+# place as you draw - one snip is at most two files, however much you edit.
+# ---------------------------------------------------------------------------
+SAVE_DIR_NAME = "SnipSquiggle"
+ANNOTATED_SUFFIX = "_2"
+AUTOSAVE_DEBOUNCE_MS = 700   # quiet period after the last edit before rewriting
+
+
+def default_save_dir():
+    """~/Pictures/SnipSquiggle, or ~/SnipSquiggle where there is no Pictures."""
+    home = os.path.expanduser("~")
+    pics = os.path.join(home, "Pictures")
+    return os.path.join(pics if os.path.isdir(pics) else home, SAVE_DIR_NAME)
+
+
+def save_snip(image, save_dir):
+    """Write the plain snip as a PNG and return its path.
+
+    Names are "snip-<date>-<time>.png". A second snip inside the same second
+    gets a "(2)" tail - deliberately not "_2", which is reserved for "the
+    annotated version of this snip" (see annotated_path)."""
+    os.makedirs(save_dir, exist_ok=True)
+    stem = "snip-" + time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(save_dir, stem + ".png")
+    dup = 2
+    while os.path.exists(path):
+        path = os.path.join(save_dir, "%s(%d).png" % (stem, dup))
+        dup += 1
+    image.save(path, "PNG")
+    return path
+
+
+def annotated_path(snip_path):
+    """The companion file for a saved snip. A GIF: annotations are animated."""
+    return os.path.splitext(snip_path)[0] + ANNOTATED_SUFFIX + ".gif"
+
+
+def open_path(path):
+    """Open a file (or folder) with the OS default handler."""
+    if IS_WIN:
+        os.startfile(path)
+    elif IS_MAC:
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
+def reveal_path(path):
+    """Show a file in the file manager, selected where the OS supports it."""
+    if IS_WIN:
+        # Explorer wants the whole thing as one token; a list would be split
+        # into separate argv entries and it would just open Documents.
+        subprocess.Popen('explorer /select,"%s"' % os.path.normpath(path))
+    elif IS_MAC:
+        subprocess.Popen(["open", "-R", path])
+    else:
+        open_path(os.path.dirname(path) or ".")
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +817,7 @@ class OverlayCapture:
 # ===========================================================================
 class Editor:
     def __init__(self, root, image, new_snip_cb, on_close=None,
-                 static_copied=False):
+                 static_copied=False, saved_path=None, save_error=None):
         self.root = root
         self.image = image.convert("RGB")
         self.new_snip_cb = new_snip_cb
@@ -768,6 +838,16 @@ class Editor:
         self._wm_drag = None       # (dx, dy) offset while dragging the logo
         self._closed = False
         self._tick_id = None
+
+        # Auto-save state. saved_path is the PNG the controller already wrote;
+        # anno_saved is its "_2" GIF, which only exists once something is drawn.
+        self.saved_path = saved_path
+        self.save_error = save_error
+        self.anno_saved = None
+        self._save_after_id = None   # pending debounced rewrite
+        self._save_thread = None     # the rewrite currently in flight, if any
+        self._save_q = queue.Queue()  # (path, error) back from that thread
+        self._resave = False         # edited again mid-write; go round again
 
         self.win = tk.Toplevel(root)
         self.win.title("SnipSquiggle")
@@ -824,6 +904,17 @@ class Editor:
         b.bind("<Leave>", lambda e: b.configure(bg=b._basebg))
         b.pack(side="left", padx=2)
         return b
+
+    def _link(self, parent, text, cmd, fg=LINK_FG):
+        """A clickable file name in the header."""
+        lk = tk.Label(parent, text=text, bg="#1e1e1e", fg=fg, cursor="hand2",
+                      font=(UI_FONT[0], UI_FONT[1], "underline"))
+        lk._basefg = fg
+        lk.bind("<Button-1>", lambda e: cmd())
+        lk.bind("<Enter>", lambda e: lk.configure(fg="#ffffff"))
+        lk.bind("<Leave>", lambda e: lk.configure(fg=lk._basefg))
+        lk.pack(side="left", padx=(2, 6))
+        return lk
 
     @staticmethod
     def _set_sel(widget, selected):
@@ -892,7 +983,24 @@ class Editor:
                                font=UI_FONT)
         self.status.pack(side="right", padx=(6, 2))
 
+        bar3 = tk.Frame(self.win, bg="#1e1e1e")
+        bar3.pack(fill="x", padx=10, pady=(0, 8))
+        self._label(bar3, "💾 Saved:")
+        self.snip_link = self._link(bar3, "", self._open_saved)
+        self.anno_sep = tk.Label(bar3, text="", bg="#1e1e1e", fg="#5a5a5a",
+                                 font=UI_FONT)
+        self.anno_sep.pack(side="left")
+        self.anno_link = self._link(bar3, "", self._open_annotated)
+        self.folder_link = self._link(bar3, "", self._open_folder)
+        self.save_status = tk.Label(bar3, text="", bg="#1e1e1e", fg="#9a9a9a",
+                                    font=UI_FONT)
+        self.save_status.pack(side="right", padx=(6, 2))
+
         self._refresh_btns()
+        self._refresh_links()
+        if self.save_error:
+            self.save_status.configure(text="⚠ auto-save failed: %s"
+                                            % self.save_error, fg="#ff6b6b")
 
     def _refresh_btns(self):
         for name, b in self.tool_btns.items():
@@ -905,6 +1013,42 @@ class Editor:
             sel = (c == self.color)
             sw.configure(highlightbackground="#ffffff" if sel else "#555",
                          highlightthickness=2 if sel else 1)
+
+    def _refresh_links(self):
+        """Header line: where this snip landed, and its annotated companion."""
+        if not self.saved_path:
+            self.snip_link._basefg = "#7a7a7a"
+            self.snip_link.configure(text="failed" if self.save_error else "off",
+                                     fg="#7a7a7a", cursor="arrow")
+            for w in (self.folder_link, self.anno_sep, self.anno_link):
+                w.configure(text="")
+            return
+        self.snip_link.configure(text=os.path.basename(self.saved_path))
+        self.folder_link.configure(text="📂 folder")
+        if self.anno_saved:
+            self.anno_sep.configure(text="·")
+            self.anno_link.configure(text="✎ "
+                                          + os.path.basename(self.anno_saved))
+        else:
+            self.anno_sep.configure(text="")
+            self.anno_link.configure(text="")
+
+    def _open(self, path, reveal=False):
+        if not path or not os.path.exists(path):
+            return
+        try:
+            (reveal_path if reveal else open_path)(path)
+        except Exception as ex:
+            messagebox.showerror("Couldn't open", str(ex), parent=self.win)
+
+    def _open_saved(self):
+        self._open(self.saved_path)
+
+    def _open_annotated(self):
+        self._open(self.anno_saved)
+
+    def _open_folder(self):
+        self._open(self.anno_saved or self.saved_path, reveal=True)
 
     def set_tool(self, name):
         self.tool = name
@@ -977,10 +1121,12 @@ class Editor:
         }
         self._rebuild_watermark()
         self._flash(self.logo_btn, "💧 drag · scroll")
+        self._mark_dirty()
 
     def remove_watermark(self):
         self.watermark = None
         self._wm_drag = None
+        self._mark_dirty()
 
     def _rebuild_watermark(self):
         """(Re)scale the logo and precompute its rippled frames + canvas photos."""
@@ -1018,6 +1164,7 @@ class Editor:
             direction = 1 if getattr(e, "delta", 0) > 0 else -1
         wm["scale"] = max(0.05, min(8.0, wm["scale"] * (1.1 if direction > 0 else 0.9)))
         self._rebuild_watermark()
+        self._mark_dirty()
 
     # -- drawing ------------------------------------------------------------
     def _down(self, e):
@@ -1059,6 +1206,7 @@ class Editor:
     def _up(self, e):
         if self._wm_drag is not None:
             self._wm_drag = None
+            self._mark_dirty()
             return
         if self._live_start is None:
             return
@@ -1083,13 +1231,17 @@ class Editor:
         ops = build_ops(polylines, self.color, self.width,
                         self.anim, self.emoji, self._seed)
         self.strokes.append({"ops": ops})
+        self._mark_dirty()
 
     def undo(self):
         if self.strokes:
             self.strokes.pop()
+            self._mark_dirty()
 
     def clear(self):
-        self.strokes.clear()
+        if self.strokes:
+            self.strokes.clear()
+            self._mark_dirty()
 
     # -- canvas animation loop ---------------------------------------------
     def _emoji_photo(self, char, px):
@@ -1101,6 +1253,7 @@ class Editor:
     def _tick(self):
         if self._closed:
             return
+        self._drain_saves()
         self.frame = (self.frame + 1) % N_FRAMES
         self.canvas.delete("stroke")
         if self.watermark:
@@ -1127,16 +1280,24 @@ class Editor:
         self._tick_id = self.win.after(FRAME_MS, self._tick)
 
     # -- gif rendering ------------------------------------------------------
-    def _render_frames(self):
+    def _render_frames(self, strokes=None, wm=None):
+        """Composite the snip + annotations into N_FRAMES full-size images.
+
+        The auto-save thread passes its own snapshot of the strokes and the
+        watermark, so a render in progress can't trip over the stroke the user
+        is drawing meanwhile. Tk-thread callers just use the live state."""
+        strokes = self.strokes if strokes is None else strokes
+        wm = self._wm_snapshot() if wm is None else wm
         frames = []
         for f in range(N_FRAMES):
             im = self.image.convert("RGBA")
-            if self.watermark:
-                g = self.watermark["frames_img"][f]
-                im.alpha_composite(g, (int(self.watermark["cx"] - g.width / 2),
-                                       int(self.watermark["cy"] - g.height / 2)))
+            if wm:
+                wframes, wcx, wcy = wm
+                g = wframes[f]
+                im.alpha_composite(g, (int(wcx - g.width / 2),
+                                       int(wcy - g.height / 2)))
             d = ImageDraw.Draw(im)
-            for s in self.strokes:
+            for s in strokes:
                 for op in s["ops"][f]:
                     kind = op[0]
                     if kind == "line":
@@ -1158,11 +1319,14 @@ class Editor:
             frames.append(im.convert("RGB"))
         return frames
 
-    def _write_gif(self, path):
-        frames = self._render_frames()
+    def _write_gif(self, path, strokes=None, wm=None):
+        frames = self._render_frames(strokes, wm)
         pframes = [fr.convert("P", palette=Image.ADAPTIVE, colors=256) for fr in frames]
-        pframes[0].save(path, save_all=True, append_images=pframes[1:],
-                        loop=0, duration=FRAME_MS, disposal=2, optimize=True)
+        # format is explicit: the auto-save renders to a ".part" temp first,
+        # and PIL would otherwise guess the format from that extension.
+        pframes[0].save(path, format="GIF", save_all=True,
+                        append_images=pframes[1:], loop=0, duration=FRAME_MS,
+                        disposal=2, optimize=True)
         return frames[0]
 
     def copy_gif(self):
@@ -1176,8 +1340,13 @@ class Editor:
         self._flash(self.copy_btn, "✓ Copied!")
 
     def save_gif(self):
+        # Start where the auto-saves live, under the same name, so an explicit
+        # save is "keep this one" rather than "hunt for a folder".
+        anno = annotated_path(self.saved_path) if self.saved_path else ""
         path = filedialog.asksaveasfilename(parent=self.win, defaultextension=".gif",
-                filetypes=[("GIF", "*.gif")], initialfile="snip.gif")
+                filetypes=[("GIF", "*.gif")],
+                initialdir=os.path.dirname(anno) or None,
+                initialfile=os.path.basename(anno) or "snip.gif")
         if not path:
             return
         try:
@@ -1199,6 +1368,126 @@ class Editor:
         if not self._closed:      # the window may be gone by now
             widget.configure(text=text)
 
+    # -- auto-save of the annotated copy ------------------------------------
+    def _wm_snapshot(self):
+        """(frames, cx, cy) - a view of the watermark safe to render off-thread."""
+        wm = self.watermark
+        if not wm or "frames_img" not in wm:
+            return None
+        return (wm["frames_img"], wm["cx"], wm["cy"])
+
+    def _mark_dirty(self):
+        """The drawing changed: queue a debounced rewrite of the "_2" file.
+
+        Debounced because an 8-frame GIF of a full-screen snip takes long
+        enough to notice, and every pen stroke lands here."""
+        if not self.saved_path or self._closed:
+            return
+        if self._save_after_id is not None:
+            try:
+                self.win.after_cancel(self._save_after_id)
+            except Exception:
+                pass
+        self._save_after_id = self.win.after(AUTOSAVE_DEBOUNCE_MS, self._autosave)
+
+    def _autosave(self):
+        self._save_after_id = None
+        if self._closed or not self.saved_path:
+            return
+        if self._saving():          # a write is in flight; go again once it lands
+            self._resave = True
+            return
+        if not self.strokes and not self.watermark:
+            self._drop_annotated()
+            return
+        strokes, wm = list(self.strokes), self._wm_snapshot()
+        self.save_status.configure(text="saving…", fg="#9a9a9a")
+        self._save_thread = threading.Thread(target=self._autosave_worker,
+                                             args=(strokes, wm), daemon=True)
+        self._save_thread.start()
+
+    def _saving(self):
+        t = self._save_thread
+        return t is not None and t.is_alive()
+
+    def _autosave_worker(self, strokes, wm):
+        """Render + write off the Tk thread, and hand the result back through a
+        queue - _tick drains it. Tcl is not thread-safe, so nothing here may
+        touch a widget."""
+        try:
+            self._save_q.put((self._write_annotated(strokes, wm), None))
+        except Exception as ex:
+            self._save_q.put((None, str(ex)))
+
+    def _write_annotated(self, strokes, wm):
+        """Write the "_2" GIF and return its path.
+
+        Rendered to a sibling temp file and swapped in, so nobody ever opens a
+        half-written GIF and a failed render can't destroy the last good one."""
+        path = annotated_path(self.saved_path)
+        tmp = path + ".part"
+        try:
+            self._write_gif(tmp, strokes, wm)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            raise
+        return path
+
+    def _drain_saves(self):
+        """Pick up finished writes (called from _tick, on the Tk thread)."""
+        try:
+            while True:
+                path, err = self._save_q.get_nowait()
+                if err:
+                    self.save_status.configure(text="⚠ save failed: " + err,
+                                               fg="#ff6b6b")
+                else:
+                    self.anno_saved = path
+                    self.save_status.configure(text="✓ saved", fg="#4cd964")
+                    self._refresh_links()
+        except queue.Empty:
+            pass
+        if self._resave and not self._saving():
+            self._resave = False
+            self._mark_dirty()
+
+    def _drop_annotated(self):
+        """Everything was undone, so bin the "_2" file - a link pointing at a
+        drawing that is no longer on screen is worse than no link. Only ever
+        removes the file this session auto-saved."""
+        if not self.anno_saved:
+            return
+        try:
+            os.remove(self.anno_saved)
+        except Exception as ex:
+            _log("couldn't remove the annotated save: %s" % ex)
+        self.anno_saved = None
+        self.save_status.configure(text="")
+        self._refresh_links()
+
+    def _finish_pending_save(self, pending):
+        """Called on the way out: a debounced edit must not die with the window.
+        Waits out any write already running, then does the last one inline -
+        closing can wait a beat, silently dropping the final stroke can't."""
+        t = self._save_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=10)
+        self._drain_saves()      # so anno_saved reflects that last write
+        if not pending or not self.saved_path:
+            return
+        if not self.strokes and not self.watermark:
+            self._drop_annotated()
+            return
+        try:
+            self.anno_saved = self._write_annotated(list(self.strokes),
+                                                    self._wm_snapshot())
+        except Exception as ex:
+            _log("final annotated save failed: %s" % ex)
+
     # -- lifecycle ----------------------------------------------------------
     def new_snip(self):
         # The controller owns the teardown (it has to know an editor is going
@@ -1216,12 +1505,16 @@ class Editor:
         ``destroy()`` and would blow up on the dead canvas (harmless in one-shot
         mode where the mainloop exits too, fatal-looking in tray mode)."""
         self._closed = True
-        if self._tick_id is not None:
-            try:
-                self.win.after_cancel(self._tick_id)
-            except Exception:
-                pass
-            self._tick_id = None
+        pending = self._save_after_id is not None or self._resave
+        for attr in ("_tick_id", "_save_after_id"):
+            tid = getattr(self, attr)
+            if tid is not None:
+                try:
+                    self.win.after_cancel(tid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._finish_pending_save(pending)
         self.win.destroy()
 
     def _quit(self):
@@ -1512,11 +1805,14 @@ class MacTray:
 # App controller
 # ===========================================================================
 class App:
-    def __init__(self, resident=False, auto_copy=True):
+    def __init__(self, resident=False, auto_copy=True, auto_save=True,
+                 save_dir=None):
         self.root = tk.Tk()
         self.root.withdraw()
         self.resident = resident and (IS_WIN or IS_MAC)
         self.auto_copy = auto_copy  # copy the plain snip as soon as it's taken
+        self.auto_save = auto_save  # ...and write it to disk just as promptly
+        self.save_dir = save_dir or default_save_dir()
         self.state = "idle"        # idle | capturing | editing
         self.editor = None         # the open Editor, if state == "editing"
         self.tray = None
@@ -1604,9 +1900,11 @@ class App:
             self._finish()
             return
         copied = self._copy_static(image)
+        saved, save_err = self._save_static(image)
         self.state = "editing"
         self.editor = Editor(self.root, image, self.request_capture,
-                             self._finish, static_copied=copied)
+                             self._finish, static_copied=copied,
+                             saved_path=saved, save_error=save_err)
 
     def _copy_static(self, image):
         """Put the raw snip on the clipboard. Best effort — a clipboard failure
@@ -1620,6 +1918,20 @@ class App:
             return False
         return True
 
+    def _save_static(self, image):
+        """Write the snip to disk before the editor is even up, so a capture is
+        never lost to a crash or a mis-click. Best effort - a full disk mustn't
+        cost the user the snip itself. Returns (path, error message)."""
+        if not self.auto_save:
+            return None, None
+        try:
+            path = save_snip(image, self.save_dir)
+        except Exception as ex:
+            _log(f"auto-save failed: {ex}")
+            return None, str(ex)
+        _log(f"snip saved to {path}")
+        return path, None
+
     def _finish(self):
         """A snip cycle ended (cancelled or editor closed)."""
         self.editor = None
@@ -1629,6 +1941,18 @@ class App:
 
     def run(self):
         self.root.mainloop()
+
+
+def _arg_value(flag, argv=None):
+    """Read `--flag VALUE` or `--flag=VALUE` out of argv. No argparse: the CLI
+    is a handful of switches and startup stays dependency-free."""
+    argv = sys.argv if argv is None else argv
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
 
 
 def _check_tk():
@@ -1648,4 +1972,6 @@ if __name__ == "__main__":
     _check_tk()
     resident = "--tray" in sys.argv or "--resident" in sys.argv
     auto_copy = "--no-copy" not in sys.argv
-    App(resident=resident, auto_copy=auto_copy).run()
+    auto_save = "--no-save" not in sys.argv
+    App(resident=resident, auto_copy=auto_copy, auto_save=auto_save,
+        save_dir=_arg_value("--save-dir")).run()

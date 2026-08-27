@@ -2,8 +2,9 @@
 
 A cross-platform Snipping-Tool clone where your annotations are **squiggly and
 animated**, and **Copy (Ctrl/Cmd+C) puts a looping GIF** on your clipboard.
-Every snip also lands on the clipboard as a plain static image the moment you
-take it, so it works as an ordinary screenshot tool too.
+Every snip also lands on the clipboard **and on disk** the moment you take it,
+so it works as an ordinary screenshot tool too - nothing is ever lost because
+you forgot to press Save.
 
 Runs on **Windows** (fully tested), **macOS**, and **Linux**.
 
@@ -16,6 +17,11 @@ Runs on **Windows** (fully tested), **macOS**, and **Linux**.
    The plain snip goes **straight onto the clipboard as a static image**, so if
    you only wanted a screenshot you can paste (Ctrl/Cmd+V) immediately and close
    the editor. Pass `--no-copy` to turn this off.
+
+   It is **saved to disk at the same moment**, before the editor is even up:
+   `~/Pictures/SnipSquiggle/snip-<date>-<time>.png`. The editor header links
+   straight to it - click the file name to open it, **📂 folder** to
+   reveal it in Explorer / Finder. See [Auto-save](#auto-save).
 2. **Editor** opens with your snip. Draw with **Pen**, **Arrow**, or **Box**,
    and pick an **animation style** per stroke:
 
@@ -141,6 +147,37 @@ Notes:
 - The app checks your Tk version at startup and exits with these instructions if
   it's too old, instead of crashing.
 
+## Auto-save
+
+Nothing you snip needs saving by hand. Two files per snip, at most:
+
+| File | Written | Contains |
+|------|---------|----------|
+| `snip-<date>-<time>.png` | the instant you finish the region select | the plain screenshot, untouched |
+| `snip-<date>-<time>_2.gif` | the first time you draw, add an emoji stroke or drop a logo on it | the annotated, animated version |
+
+The `_2` file is **rewritten in place** every time you edit - draw ten more
+strokes and it is still one file, always matching what is on screen. It is a
+GIF because annotations move. Undo everything and it is removed again, so the
+header link never points at a drawing you already binned.
+
+The editor header shows both files as links: click a name to open it, or
+**📂 folder** to reveal it in Explorer / Finder. Saves run on a
+background thread ~0.7 s after your last edit, so drawing never stutters; a save
+still pending when you close is flushed first.
+
+**Ctrl/Cmd+S** is still there for "put a copy somewhere else" - it opens the
+save dialog in the auto-save folder.
+
+| Flag | Effect |
+|------|--------|
+| `--no-save` | don't write anything to disk (clipboard only) |
+| `--save-dir DIR` | put auto-saved snips somewhere other than `~/Pictures/SnipSquiggle` |
+
+```sh
+python snipsquiggle.py --save-dir "D:/screenshots"
+```
+
 ## Shortcuts (in the editor)
 
 Use **Ctrl** on Windows/Linux, **Cmd** on macOS.
@@ -148,7 +185,7 @@ Use **Ctrl** on Windows/Linux, **Cmd** on macOS.
 | Key         | Action              |
 |-------------|---------------------|
 | `⌃/⌘ + C`   | Copy animated GIF   |
-| `⌃/⌘ + S`   | Save GIF to disk    |
+| `⌃/⌘ + S`   | Save a copy elsewhere (auto-save already wrote one) |
 | `⌃/⌘ + Z`   | Undo last stroke    |
 | `⌃/⌘ + N`   | New snip            |
 | `PrintScreen` | New snip (Windows/Linux — same as the global hotkey) |
@@ -201,6 +238,8 @@ Tuning constants live at the top of `snipsquiggle.py`:
 - `JITTER_BASE` – how squiggly the lines are
 - `RESAMPLE_SPACING` – wobble granularity
 - `EMOJIS` – the emoji picker set
+- `AUTOSAVE_DEBOUNCE_MS` – quiet period after your last edit before the
+  `_2` file is rewritten
 
 Each stroke precomputes `N_FRAMES` of backend-agnostic draw *ops* (lines, dots,
 emoji stamps) that both the live canvas preview and the GIF exporter consume, so
