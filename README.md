@@ -22,8 +22,11 @@ Runs on **Windows** (fully tested), **macOS**, and **Linux**.
    `~/Pictures/SnipSquiggle/snip-<date>-<time>.png`. The editor header links
    straight to it - click the file name to open it, **📂 folder** to
    reveal it in Explorer / Finder. See [Auto-save](#auto-save).
-2. **Editor** opens with your snip. Draw with **Pen**, **Arrow**, or **Box**,
-   and pick an **animation style** per stroke:
+2. **Editor** opens with your snip. Draw with **✎ Pen** or a **shape**: the
+   shape button draws the last shape you picked, and **▾** next to it picks
+   another. Shapes are Box, Ellipse, Line, Arrow, Double arrow, Triangle,
+   Diamond, Star and Heart. Hold **Shift** while dragging for a square or
+   circle, or to snap a line to 45°. Then pick an **animation style** per stroke:
 
    | Style   | Look                                            |
    |---------|-------------------------------------------------|
@@ -33,6 +36,30 @@ Runs on **Windows** (fully tested), **macOS**, and **Linux**.
    | 😀 Emoji | emojis marching + bobbing along the stroke (🔥 ❤️ ⭐ ✅ 👍 …) |
 
    ![animation styles](docs/styles.png)
+
+   **＋ Any** uses *any* emoji. It opens a small box and the OS emoji
+   picker on top of it: the Windows emoji panel (Win + .) or the macOS
+   Character Viewer. Click an emoji and it is applied straight away. You can
+   also type or paste an emoji, or short text such as `FFS`, and press Enter.
+   (On Linux, type or paste.) The emoji you pick stay in the bar next time.
+
+   **T Text** adds text. Click where it goes, type, and press **Enter**.
+   **Shift+Enter** starts a new line and **Esc** cancels. The **Text** row picks
+   the font (whatever is installed from Arial, Segoe UI, Georgia, Impact,
+   Comic Sans, Ink Free, Marker Felt and others), the size (14–96 px) and a
+   contrasting **outline** so the text reads on any background. Double-click
+   a text to edit it.
+
+   **↖ Move** lets you drag anything you have already drawn. Click an item to
+   select it. Then **Del** removes it, the arrow keys nudge it (add Shift
+   for 10 px), and **Ctrl/Cmd+D** duplicates it. Changing the colour, width,
+   animation, emoji, font or size while an item is selected restyles that
+   item. **Undo** reverts moves and restyles as well as new strokes.
+
+   **Right-click** (Ctrl+click on a Mac) opens a menu for quick picks: tool,
+   shape, colour, width, animation, emoji, font and text size. Right-click an
+   item to get its own actions too: edit text, duplicate, bring to front, send
+   to back, delete. Style picks made from that menu apply to the item.
 
    Optionally add a **company / logo watermark** with **💧 Logo** — pick any
    PNG/GIF/JPG (transparent PNG looks best), or re-pick one of your
@@ -186,10 +213,18 @@ Use **Ctrl** on Windows/Linux, **Cmd** on macOS.
 |-------------|---------------------|
 | `⌃/⌘ + C`   | Copy animated GIF   |
 | `⌃/⌘ + S`   | Save a copy elsewhere (auto-save already wrote one) |
-| `⌃/⌘ + Z`   | Undo last stroke    |
+| `⌃/⌘ + Z`   | Undo (strokes, moves, restyles) |
+| `⌃/⌘ + D`   | Duplicate the selected item |
 | `⌃/⌘ + N`   | New snip            |
+| `V` `P` `T` | Move / Pen / Text tool |
+| `B` `E` `L` `A` | Box / Ellipse / Line / Arrow |
+| `Del`, arrow keys | Delete / nudge the selected item (Shift = 10 px) |
+| Right-click | Quick menu (tools, shapes, styles, item actions) |
 | `PrintScreen` | New snip (Windows/Linux — same as the global hotkey) |
-| `Esc`       | Quit                |
+| `Esc`       | Deselect, or quit if nothing is selected |
+
+Letter shortcuts and `⌃/⌘` shortcuts are ignored while a text box is open, so
+you can type into it and use copy and undo inside the text normally.
 
 The snip hotkey works **while the editor is open**: it throws the current snip
 away and starts a fresh region select, just like **＋ New**. (A press while the
@@ -237,14 +272,19 @@ Tuning constants live at the top of `snipsquiggle.py`:
 - `FRAME_MS` – animation speed / GIF frame delay
 - `JITTER_BASE` – how squiggly the lines are
 - `RESAMPLE_SPACING` – wobble granularity
-- `EMOJIS` – the emoji picker set
+- `EMOJIS` – the emoji picker set (picks from **＋ Any** are kept in
+  `~/.snipsquiggle_emoji.json`)
+- `SHAPES`, `TEXT_FONTS`, `TEXT_SIZES` – the shape list, the font candidates
+  (fonts that aren't installed are hidden) and the text sizes
 - `AUTOSAVE_DEBOUNCE_MS` – quiet period after your last edit before the
   `_2` file is rewritten
 
-Each stroke precomputes `N_FRAMES` of backend-agnostic draw *ops* (lines, dots,
-emoji stamps) that both the live canvas preview and the GIF exporter consume, so
-what you see is exactly what gets copied. Add a new style by extending
-`build_ops()`.
+Each item precomputes `N_FRAMES` of backend-agnostic draw *ops* (lines, dots,
+emoji stamps, and text rendered by Pillow as an image). Both the live canvas
+preview and the GIF exporter use these ops, so what you see is exactly what
+gets copied. Items are never changed in place: moving or restyling one builds
+a new item, which keeps undo and the background auto-save simple. Add a new
+style by extending `build_ops()`, or a new shape in `shape_polylines()`.
 
 The GIF is 256-color (GIF format limit), so photo-heavy snips will dither a
 little. The animated part is your drawing; the background stays put.
